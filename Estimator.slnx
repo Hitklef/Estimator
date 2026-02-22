@@ -1,1 +1,4 @@
-<Solution />
+<Solution>
+  <Project Path="src/Estimator.Api/Estimator.Api.csproj" />
+  <Project Path="src/Estimator.Core/Estimator.Core.csproj" />
+</Solution>
