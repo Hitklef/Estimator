@@ -1,14 +1,12 @@
 using Estimator.Core.Agents;
-using Estimator.Core.Models;
 using Estimator.Core.Models.Options;
 using Estimator.Core.Orchestrator;
 using Estimator.Core.Services;
 using NLog;
 using NLog.Web;
-using System.Text.Json;
 
 var logger = LogManager.Setup().LoadConfigurationFromAppSettings().GetCurrentClassLogger();
-logger.Debug("init main");
+logger.Debug("API bootstrap started.");
 
 try
 {
@@ -17,26 +15,20 @@ try
     builder.Logging.ClearProviders();
     builder.Host.UseNLog();
 
-    #region Options
     builder.Services.Configure<AiSettings>(builder.Configuration.GetSection(AiSettings.SectionName));
-    #endregion
 
-    #region Service
     builder.Services.AddSingleton<ModelManager>();
-    builder.Services.AddSingleton<LlamaModelService>();
-
-    builder.Services.AddSingleton<ArchitectAgent>();
+    builder.Services.AddSingleton<IAgentModelGateway, LlamaModelService>();
+    builder.Services.AddSingleton<DecomposerAgent>();
     builder.Services.AddSingleton<EstimatorAgent>();
-    builder.Services.AddSingleton<ReviewerAgent>();
-
+    builder.Services.AddSingleton<ValidatorAgent>();
+    builder.Services.AddSingleton<IEstimationPolicy, EstimationPolicy>();
     builder.Services.AddSingleton<AgentOrchestrator>();
-    #endregion
 
-    // Add services to the container.
-    // Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
     builder.Services.AddOpenApi();
 
     var app = builder.Build();
+
     using (var scope = app.Services.CreateScope())
     {
         var modelManager = scope.ServiceProvider.GetRequiredService<ModelManager>();
@@ -50,32 +42,22 @@ try
 
     app.UseHttpsRedirection();
 
-    app.MapPost("/estimate", async (ProjectRequest request, AgentOrchestrator orchestrator) =>
+    app.MapPost("/estimate", async (ProjectRequest request, AgentOrchestrator orchestrator, CancellationToken cancellationToken) =>
     {
-        if (string.IsNullOrWhiteSpace(request.Description)) 
+        if (string.IsNullOrWhiteSpace(request.Description))
         {
-            return Results.BadRequest("Description is required.");
+            return Results.BadRequest(new { status = "Error", message = "Description is required." });
         }
-           
-        var resultJson = await orchestrator.RunWorkflowAsync(request.Description);
 
-        try
-        {
-            var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
-            var finalResult = JsonSerializer.Deserialize<List<ProjectTask>>(resultJson, options);
-            return Results.Ok(new { status = "Success", data = finalResult });
-        }
-        catch
-        {
-            return Results.Ok(new { status = "Warning", message = resultJson });
-        }
+        var plan = await orchestrator.RunWorkflowAsync(request.Description, cancellationToken);
+        return Results.Ok(new { status = "Success", data = plan });
     });
 
     app.Run();
 }
 catch (Exception exception)
 {
-    logger.Error(exception, "Stopped program because of exception");
+    logger.Error(exception, "Application stopped due to an exception.");
     throw;
 }
 finally
@@ -83,4 +65,4 @@ finally
     LogManager.Shutdown();
 }
 
-public record ProjectRequest(string Description);
+public sealed record ProjectRequest(string Description);

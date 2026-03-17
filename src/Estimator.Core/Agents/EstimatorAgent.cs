@@ -1,36 +1,43 @@
-﻿using Estimator.Core.Services;
 using Microsoft.Extensions.Logging;
 
 namespace Estimator.Core.Agents
 {
-    public class EstimatorAgent : BaseAgent
+    public sealed class EstimatorAgent : BaseAgent
     {
-        public EstimatorAgent(LlamaModelService modelService, ILogger<EstimatorAgent> logger)
-            : base(modelService, logger)
+        public EstimatorAgent(IAgentModelGateway modelGateway, ILogger<EstimatorAgent> logger)
+            : base(modelGateway, logger)
         {
         }
 
+        public override AgentRole Role => AgentRole.Estimator;
+
         protected override string SystemPrompt =>
-            @"You are a Senior Technical Estimator. Your task is to provide realistic time estimates in hours for technical tasks.
-              Rules for estimation:
-              1. Standard increments: All estimates MUST be multiples of 4 (e.g., 4, 8, 12, 16, 24, 40).
-              2. Exceptions: 
-                 - Very small tasks (e.g., configuration, simple UI tweaks) can be 1 or 2 hours.
-                 - If specific historical data (RAG context) is provided, prioritize that data even if it contradicts the 'multiple of 4' rule.
-              3. Realistic approach: Account for coding, unit testing, debugging, and initial environment setup.
-              4. Task Complexity: For complex integrations (OAuth, Payment Gateways, Legacy Migrations), add a buffer.
-              
-              CRITICAL: Return ONLY a valid JSON array. No preamble, no explanation.
-              
-              Output Format:
-              [
-                {
-                  ""id"": 1,
-                  ""title"": ""Task Title"",
-                  ""description"": ""Task Description"",
-                  ""tech_stack"": [""Stack""],
-                  ""estimated_hours"": 8
-                }
-              ]";
+            """
+            You are Agent 2 (Estimator), a senior engineering estimator.
+            Estimate each task in hours with realistic effort for production delivery.
+
+            Mandatory rules:
+            1. Estimates must include coding, unit/integration testing, debugging, and review.
+            2. Use multiples of 4 hours by default (4, 8, 12, 16, ...).
+            3. Allow 1-2 hour estimates only for highly specific micro tasks.
+            4. Be conservative for integrations, security, infra, architecture, privacy, and animation-heavy tasks.
+            5. Avoid optimistic bias. If uncertain, round up.
+            6. Use benchmark context provided in the user payload:
+               - category ranges
+               - minimum total hours
+            7. Ensure production overhead is reflected (QA, PM/UX reviews, release hardening).
+            8. If a category is under-ranged, increase related tasks before returning.
+
+            Output must be ONLY a valid JSON array:
+            [
+              {
+                "id": 1,
+                "title": "Task title",
+                "description": "Task detail",
+                "tech_stack": ["C#", ".NET"],
+                "estimated_hours": 12
+              }
+            ]
+            """;
     }
 }

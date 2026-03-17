@@ -1,53 +1,51 @@
-﻿using Estimator.Core.Services;
-using LLama.Common;
-using LLama.Sampling;
 using Microsoft.Extensions.Logging;
 
 namespace Estimator.Core.Agents
 {
-    public abstract class BaseAgent
+    public enum AgentRole
     {
-        protected readonly LlamaModelService _modelService;
-        protected readonly ILogger _logger;
+        Decomposer,
+        Estimator,
+        Validator
+    }
+
+    public interface IAgent
+    {
+        AgentRole Role { get; }
+        Task<string> ExecuteAsync(string userInput, CancellationToken cancellationToken = default);
+    }
+
+    public interface IAgentModelGateway
+    {
+        Task<string> CompleteAsync(
+            AgentRole role,
+            string systemPrompt,
+            string userInput,
+            CancellationToken cancellationToken = default);
+    }
+
+    public abstract class BaseAgent : IAgent
+    {
+        private readonly IAgentModelGateway _modelGateway;
+        private readonly ILogger _logger;
 
         protected abstract string SystemPrompt { get; }
+        public abstract AgentRole Role { get; }
 
-        protected BaseAgent(LlamaModelService modelService, ILogger logger)
+        protected BaseAgent(IAgentModelGateway modelGateway, ILogger logger)
         {
-            _modelService = modelService;
+            _modelGateway = modelGateway;
             _logger = logger;
         }
 
-        public async Task<string> ExecuteAsync(string userInput)
+        public async Task<string> ExecuteAsync(string userInput, CancellationToken cancellationToken = default)
         {
-            _logger.LogInformation("Agent {AgentType} is processing request...", GetType().Name);
+            _logger.LogInformation("Agent {Role} started processing.", Role);
 
-            var executor = _modelService.GetExecutor();
+            var response = await _modelGateway.CompleteAsync(Role, SystemPrompt, userInput, cancellationToken);
 
-            var inferenceParams = new InferenceParams
-            {
-                MaxTokens = 2048,
-                AntiPrompts = new[] { "User:" },
-                SamplingPipeline = new DefaultSamplingPipeline
-                {
-                    Temperature = 0.7f,
-                    TopP = 0.9f
-                }
-            };
-
-            string fullPrompt = $"<|im_start|>system\n{SystemPrompt}<|im_end|>\n<|im_start|>user\n{userInput}<|im_end|>\n<|im_start|>assistant\n";
-
-            string response = string.Empty;
-
-            await foreach (var text in executor.InferAsync(fullPrompt, inferenceParams))
-            {
-                response += text;
-                Console.Write(text);
-            }
-            Console.WriteLine();
-
-            _logger.LogDebug("Agent {AgentType} response: {Response}", GetType().Name, response);
-            return response.Trim();
+            _logger.LogDebug("Agent {Role} raw response length: {Length}", Role, response.Length);
+            return response;
         }
     }
 }

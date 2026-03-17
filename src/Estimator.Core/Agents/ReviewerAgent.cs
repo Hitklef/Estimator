@@ -1,31 +1,38 @@
-﻿using Estimator.Core.Services;
 using Microsoft.Extensions.Logging;
 
 namespace Estimator.Core.Agents
 {
-    public class ReviewerAgent : BaseAgent
+    public sealed class ValidatorAgent : BaseAgent
     {
-        public ReviewerAgent(LlamaModelService modelService, ILogger<ReviewerAgent> logger)
-            : base(modelService, logger)
+        public ValidatorAgent(IAgentModelGateway modelGateway, ILogger<ValidatorAgent> logger)
+            : base(modelGateway, logger)
         {
         }
 
+        public override AgentRole Role => AgentRole.Validator;
+
         protected override string SystemPrompt =>
-            @"You are a Quality Assurance Manager and Project Reviewer. 
-              Your job is to validate the task decomposition and time estimates.
+            """
+            You are Agent 3 (Validator). Validate ONLY estimation accuracy and sanity.
+            Do not ask for new roadmap tasks. Do not evaluate decomposition completeness.
 
-              Check for:
-              1. Logical consistency: Does the time match the task complexity?
-              2. Completeness: Is the tech stack appropriate?
-              3. Errors: Are there any ridiculous estimates (e.g., 100 hours for a simple Readme)?
+            Validation rules:
+            1. Verify estimated hours are realistic for task complexity.
+            2. Reject optimistic estimates that ignore delivery overhead.
+            3. Enforce that non-micro tasks use 4-hour increments.
+            4. Compare category totals against benchmark ranges included in payload.
+            5. Return specific invalid task IDs when possible.
+            6. Always route corrections to Estimator.
 
-              If the estimate is realistic and follows all rules, return ONLY the word 'VALID'. 
-              If there are issues (wrong hours, missing tasks), return a JSON object:
+            Response format:
+            - If valid: return exactly VALID
+            - If invalid: return JSON object only:
               {
-                  ""status"": ""REJECTED"",
-                  ""reason"": ""explanation""
+                "status": "REJECTED",
+                "target_agent": "Estimator",
+                "reason": "Specific actionable feedback",
+                "invalid_task_ids": [2, 5, 8]
               }
-              
-              CRITICAL: Do not wrap 'VALID' in JSON or quotes.";
+            """;
     }
 }

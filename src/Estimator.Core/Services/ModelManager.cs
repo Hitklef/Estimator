@@ -1,11 +1,12 @@
-﻿using Estimator.Core.Models.Options;
+using Estimator.Core.Models.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Estimator.Core.Services
 {
-    public class ModelManager
+    public sealed class ModelManager
     {
+        private static readonly HttpClient HttpClient = new();
         private readonly AiSettings _settings;
         private readonly ILogger<ModelManager> _logger;
 
@@ -15,73 +16,86 @@ namespace Estimator.Core.Services
             _logger = logger;
         }
 
-        public async Task EnsureModelDownloadedAsync()
+        public async Task EnsureModelDownloadedAsync(CancellationToken cancellationToken = default)
         {
             var filePath = _settings.LocalModelPath;
             var directory = Path.GetDirectoryName(filePath);
 
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+            if (!string.IsNullOrWhiteSpace(directory) && !Directory.Exists(directory))
             {
-                _logger.LogInformation("Creating directory for models: {Directory}", directory);
+                _logger.LogInformation("Creating model directory: {Directory}", directory);
                 Directory.CreateDirectory(directory);
             }
 
             if (File.Exists(filePath))
             {
-                _logger.LogInformation("Model file already exists: {Path}", filePath);
+                _logger.LogInformation("Model found: {Path}", filePath);
                 return;
             }
 
-            _logger.LogWarning("Model file not found at {Path}. Starting download from {Url}...", filePath, _settings.ModelUrl);
+            if (string.IsNullOrWhiteSpace(_settings.ModelUrl))
+            {
+                throw new InvalidOperationException("ModelUrl is required when local model file is missing.");
+            }
 
+            _logger.LogWarning("Model not found at {Path}. Downloading from {Url}.", filePath, _settings.ModelUrl);
+
+            HttpClient.Timeout = TimeSpan.FromMinutes(Math.Max(5, _settings.DownloadTimeoutMinutes));
             try
             {
-                using var client = new HttpClient();
-                client.Timeout = TimeSpan.FromMinutes(30);
+                using var response = await HttpClient.GetAsync(
+                    _settings.ModelUrl,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
 
-                using var response = await client.GetAsync(_settings.ModelUrl, HttpCompletionOption.ResponseHeadersRead);
                 response.EnsureSuccessStatusCode();
 
                 var totalBytes = response.Content.Headers.ContentLength ?? -1L;
-                using var contentStream = await response.Content.ReadAsStreamAsync();
-                using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true);
+                await using var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                await using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
 
-                var buffer = new byte[8192];
+                var buffer = new byte[131072];
                 long totalRead = 0;
-                int read;
-                int lastReportedProgress = -1;
-
-                while ((read = await contentStream.ReadAsync(buffer)) > 0)
+                var lastLoggedProgress = -1;
+                int bytesRead;
+                while ((bytesRead = await contentStream.ReadAsync(buffer.AsMemory(0, buffer.Length), cancellationToken)) > 0)
                 {
-                    await fileStream.WriteAsync(buffer.AsMemory(0, read));
-                    totalRead += read;
+                    await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+                    totalRead += bytesRead;
 
-                    if (totalBytes != -1)
+                    if (totalBytes <= 0)
                     {
-                        var progress = (int)((double)totalRead / totalBytes * 100);
+                        continue;
+                    }
 
-                        if (progress % 10 == 0 && progress != lastReportedProgress)
-                        {
-                            _logger.LogInformation("Download progress: {Progress}% ({(Read / 1024 / 1024):F0}MB)", progress, totalRead);
-                            lastReportedProgress = progress;
-                        }
-                        Console.Write($"\r[AI] Downloading: {progress}% ({(totalRead / 1024 / 1024):F0}MB / {(totalBytes / 1024 / 1024):F0}MB)");
+                    var progress = (int)((double)totalRead / totalBytes * 100);
+                    if (progress >= lastLoggedProgress + 10)
+                    {
+                        _logger.LogInformation("Model download progress: {Progress}% ({ReadMb}MB/{TotalMb}MB)", progress, totalRead / 1024 / 1024, totalBytes / 1024 / 1024);
+                        lastLoggedProgress = progress;
                     }
                 }
 
-                Console.WriteLine(); 
                 _logger.LogInformation("Model download completed: {Path}", filePath);
+            }
+            catch (OperationCanceledException)
+            {
+                CleanupPartialFile(filePath);
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogCritical(ex, "Critical error during model download: {Message}", ex.Message);
-
-                if (File.Exists(filePath)) 
-                { 
-                    File.Delete(filePath); 
-                }
-                    
+                CleanupPartialFile(filePath);
+                _logger.LogCritical(ex, "Model download failed.");
                 throw;
+            }
+        }
+
+        private static void CleanupPartialFile(string filePath)
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
             }
         }
     }

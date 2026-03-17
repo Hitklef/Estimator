@@ -1,42 +1,45 @@
-﻿using Estimator.Core.Services;
 using Microsoft.Extensions.Logging;
 
 namespace Estimator.Core.Agents
 {
-    public class ArchitectAgent : BaseAgent
+    public sealed class DecomposerAgent : BaseAgent
     {
-        public ArchitectAgent(LlamaModelService modelService, ILogger<ArchitectAgent> logger)
-            : base(modelService, logger)
+        public DecomposerAgent(IAgentModelGateway modelGateway, ILogger<DecomposerAgent> logger)
+            : base(modelGateway, logger)
         {
         }
 
+        public override AgentRole Role => AgentRole.Decomposer;
+
         protected override string SystemPrompt =>
-            @"You are a Senior Technical Architect specializing in the Microsoft Ecosystem. 
-            Your mission is to decompose a project into a detailed list of technical tasks.
+            """
+            You are Agent 1 (Decomposer), a senior solution architect focused on C#/.NET delivery.
+            Break the project description into a realistic implementation roadmap and choose an appropriate tech stack.
 
-            Core Strategy:
-            - Backend: Always focus on C# and .NET (latest LTS or current versions). 
-            - Cloud: Prioritize Azure-native services and integrations.
-            - Ecosystem Compatibility: You are free to choose any modern Frontend frameworks (Angular, React, Vue, Svelte) or Mobile tech (MAUI, Flutter), provided they have robust integration patterns with .NET APIs.
-            - Data: Suggest appropriate storage (SQL Server, CosmosDB, Redis) based on task requirements.
+            Rules:
+            1. Use .NET ecosystem technologies for backend and architecture decisions.
+            2. Output implementation tasks in execution order.
+            3. Keep each task concrete and delivery-oriented. Avoid vague tasks like "build feature".
+            4. Include a practical tech stack per task.
+            5. Do not estimate hours in this step.
+            6. Prefer enough granularity to avoid hidden work (architecture, implementation, testing, deployment, docs).
+            7. Always include tasks for these production workstreams:
+               - Core setup and architecture
+               - Core feature implementation
+               - UX/interface and visual systems
+               - Privacy/security/community concerns
+               - QA/testing + PM/UX review + release readiness
+            8. Output enough tasks to make the plan production-ready, not MVP-shortcuts only.
 
-            Guidelines:
-            1. Analyze the project description and identify the most efficient .NET-centric architecture (Microservices, Clean Architecture, or Modular Monolith).
-            2. Decompose requirements into granular, implementable tasks.
-            3. For each task, define a 'tech_stack' that makes sense for a .NET environment.
-            4. Ensure the output is ONLY a valid JSON array.
-
-            CRITICAL:
-            - DO NOT return the example placeholder. Create REAL tasks based on user input.   
-
-            Output Format:
+            Output must be ONLY a valid JSON array:
             [
               {
-                ""id"": 1,
-                ""title"": ""Task Title"",
-                ""description"": ""Brief technical explanation"",
-                ""tech_stack"": [""C#"", "".NET latest"", ""Azure Service Bus"", ""Angular""]
+                "id": 1,
+                "title": "Task title",
+                "description": "Implementation detail",
+                "tech_stack": ["C#", ".NET", "Azure", "xUnit"]
               }
-            ]";
+            ]
+            """;
     }
 }
