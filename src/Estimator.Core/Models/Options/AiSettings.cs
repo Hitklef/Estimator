@@ -13,6 +13,12 @@ namespace Estimator.Core.Models.Options
         public int DownloadTimeoutMinutes { get; set; } = 30;
         public int AgentInferenceTimeoutSeconds { get; set; } = 60;
         public int MaxValidationCycles { get; set; } = 2;
+        public int ContextSafetyMarginTokens { get; set; } = 256;
+        public int MinimumGenerationTokens { get; set; } = 256;
+        public int MaxPromptCharacters { get; set; } = 20000;
+        public int RetryMaxPromptCharacters { get; set; } = 12000;
+        public int DocumentMaxExtractedCharacters { get; set; } = 20000;
+        public int DocumentRepeatedLineThreshold { get; set; } = 8;
 
         public Dictionary<string, AgentRuntimeProfile> AgentRuntimeProfiles { get; set; } = CreateDefaultProfiles();
         public EstimationPolicySettings EstimationPolicy { get; set; } = new();
@@ -68,9 +74,9 @@ namespace Estimator.Core.Models.Options
             new(StringComparer.OrdinalIgnoreCase)
             {
                 ["Default"] = new AgentRuntimeProfile(),
-                ["Decomposer"] = new AgentRuntimeProfile { MaxTokens = 2048, Temperature = 0.2f, TopP = 0.88f },
-                ["Estimator"] = new AgentRuntimeProfile { MaxTokens = 2048, Temperature = 0.15f, TopP = 0.82f },
-                ["Validator"] = new AgentRuntimeProfile { MaxTokens = 512, Temperature = 0.08f, TopP = 0.78f }
+                ["Decomposer"] = new AgentRuntimeProfile { MaxTokens = 1024, Temperature = 0.2f, TopP = 0.88f },
+                ["Estimator"] = new AgentRuntimeProfile { MaxTokens = 1024, Temperature = 0.15f, TopP = 0.82f },
+                ["Validator"] = new AgentRuntimeProfile { MaxTokens = 384, Temperature = 0.08f, TopP = 0.78f }
             };
 
         private static List<BenchmarkProfileSettings> CreateDefaultBenchmarkProfiles() =>
@@ -198,7 +204,7 @@ namespace Estimator.Core.Models.Options
 
     public sealed class AgentRuntimeProfile
     {
-        public int MaxTokens { get; set; } = 2048;
+        public int MaxTokens { get; set; } = 1024;
         public float Temperature { get; set; } = 0.2f;
         public float TopP { get; set; } = 0.9f;
         public List<string> AntiPrompts { get; set; } = new() { "User:" };

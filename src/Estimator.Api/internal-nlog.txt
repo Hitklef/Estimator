@@ -88,3 +88,33 @@
 2026-03-17 19:25:43.9831 Info Registered target NLog.Targets.ConsoleTarget(Name=logconsole)
 2026-03-17 19:25:43.9831 Info NLog, Version=6.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c. File version: 6.1.0.4914. Product version: 6.1.0+5b1846554f5a8f98878ca64cce5a485ca3b8275c. GlobalAssemblyCache: False
 2026-03-17 19:25:44.0187 Info Configuration initialized: TargetNames=logfile, logconsole, ConfigItems=27, AutoReload=true, FilePath=C:\Projects\Estimator\src\Estimator.Api\bin\Debug\net10.0\nlog.config
+2026-03-19 18:08:41.6824 Warn Error has been raised. Exception: NLog.NLogConfigurationException: 'FileTarget' cannot assign unknown property 'concurrentWrites'='true'
+   at NLog.Config.LoggingConfigurationParser.SetPropertyValueFromString[T](T targetObject, String propertyName, String propertyValue, ValidatedConfigurationElement element)
+2026-03-19 18:08:41.7022 Info Registered target NLog.Targets.FileTarget(Name=logfile)
+2026-03-19 18:08:41.7035 Info Registered target NLog.Targets.ConsoleTarget(Name=logconsole)
+2026-03-19 18:08:41.7035 Info NLog, Version=6.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c. File version: 6.1.0.4914. Product version: 6.1.0+5b1846554f5a8f98878ca64cce5a485ca3b8275c. GlobalAssemblyCache: False
+2026-03-19 18:08:41.7348 Info Configuration initialized: TargetNames=logfile, logconsole, ConfigItems=27, AutoReload=true, FilePath=C:\Projects\Estimator\src\Estimator.Api\bin\Debug\net10.0\nlog.config
+2026-03-19 18:10:43.9115 Warn Error has been raised. Exception: NLog.NLogConfigurationException: 'FileTarget' cannot assign unknown property 'concurrentWrites'='true'
+   at NLog.Config.LoggingConfigurationParser.SetPropertyValueFromString[T](T targetObject, String propertyName, String propertyValue, ValidatedConfigurationElement element)
+2026-03-19 18:10:43.9312 Info Registered target NLog.Targets.FileTarget(Name=logfile)
+2026-03-19 18:10:43.9312 Info Registered target NLog.Targets.ConsoleTarget(Name=logconsole)
+2026-03-19 18:10:43.9312 Info NLog, Version=6.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c. File version: 6.1.0.4914. Product version: 6.1.0+5b1846554f5a8f98878ca64cce5a485ca3b8275c. GlobalAssemblyCache: False
+2026-03-19 18:10:43.9675 Info Configuration initialized: TargetNames=logfile, logconsole, ConfigItems=27, AutoReload=true, FilePath=C:\Projects\Estimator\src\Estimator.Api\bin\Debug\net10.0\nlog.config
+2026-03-19 18:11:59.6904 Warn Error has been raised. Exception: NLog.NLogConfigurationException: 'FileTarget' cannot assign unknown property 'concurrentWrites'='true'
+   at NLog.Config.LoggingConfigurationParser.SetPropertyValueFromString[T](T targetObject, String propertyName, String propertyValue, ValidatedConfigurationElement element)
+2026-03-19 18:11:59.7163 Info Registered target NLog.Targets.FileTarget(Name=logfile)
+2026-03-19 18:11:59.7163 Info Registered target NLog.Targets.ConsoleTarget(Name=logconsole)
+2026-03-19 18:11:59.7205 Info NLog, Version=6.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c. File version: 6.1.0.4914. Product version: 6.1.0+5b1846554f5a8f98878ca64cce5a485ca3b8275c. GlobalAssemblyCache: False
+2026-03-19 18:11:59.7546 Info Configuration initialized: TargetNames=logfile, logconsole, ConfigItems=27, AutoReload=true, FilePath=C:\Projects\Estimator\src\Estimator.Api\bin\Debug\net10.0\nlog.config
+2026-03-19 18:17:15.1625 Warn Error has been raised. Exception: NLog.NLogConfigurationException: 'FileTarget' cannot assign unknown property 'concurrentWrites'='true'
+   at NLog.Config.LoggingConfigurationParser.SetPropertyValueFromString[T](T targetObject, String propertyName, String propertyValue, ValidatedConfigurationElement element)
+2026-03-19 18:17:15.1779 Info Registered target NLog.Targets.FileTarget(Name=logfile)
+2026-03-19 18:17:15.1779 Info Registered target NLog.Targets.ConsoleTarget(Name=logconsole)
+2026-03-19 18:17:15.1779 Info NLog, Version=6.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c. File version: 6.1.0.4914. Product version: 6.1.0+5b1846554f5a8f98878ca64cce5a485ca3b8275c. GlobalAssemblyCache: False
+2026-03-19 18:17:15.2089 Info Configuration initialized: TargetNames=logfile, logconsole, ConfigItems=27, AutoReload=true, FilePath=C:\Projects\Estimator\src\Estimator.Api\bin\Debug\net10.0\nlog.config
+2026-03-19 18:35:16.3037 Warn Error has been raised. Exception: NLog.NLogConfigurationException: 'FileTarget' cannot assign unknown property 'concurrentWrites'='true'
+   at NLog.Config.LoggingConfigurationParser.SetPropertyValueFromString[T](T targetObject, String propertyName, String propertyValue, ValidatedConfigurationElement element)
+2026-03-19 18:35:16.3190 Info Registered target NLog.Targets.FileTarget(Name=logfile)
+2026-03-19 18:35:16.3190 Info Registered target NLog.Targets.ConsoleTarget(Name=logconsole)
+2026-03-19 18:35:16.3190 Info NLog, Version=6.0.0.0, Culture=neutral, PublicKeyToken=5120e14c03d0593c. File version: 6.1.0.4914. Product version: 6.1.0+5b1846554f5a8f98878ca64cce5a485ca3b8275c. GlobalAssemblyCache: False
+2026-03-19 18:35:16.3506 Info Configuration initialized: TargetNames=logfile, logconsole, ConfigItems=27, AutoReload=true, FilePath=C:\Projects\Estimator\src\Estimator.Api\bin\Debug\net10.0\nlog.config
