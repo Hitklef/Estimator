@@ -1,8 +1,8 @@
 using System.Text;
-using System.Text.Json;
 using Estimator.Core.Agents;
 using Estimator.Core.Models;
 using Estimator.Core.Models.Options;
+using Estimator.Core.Services;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
@@ -10,11 +10,6 @@ namespace Estimator.Core.Orchestrator
 {
     public sealed class AgentOrchestrator
     {
-        private static readonly JsonSerializerOptions JsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true
-        };
-
         private static readonly string[] MicroTaskKeywords =
         [
             "typo", "copy update", "text tweak", "rename", "minor style", "simple config", "metadata", "lint", "small refactor"
@@ -37,29 +32,87 @@ namespace Estimator.Core.Orchestrator
             "high availability", "offline sync", "recovery"
         ];
 
+        private static readonly Dictionary<string, List<RoadmapTemplate>> WorkstreamTemplates = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["CoreSetupArchitecture"] =
+            [
+                new("Set up development environment", "Install required SDKs, configure local tooling, and establish the base solution structure.", [".NET", "C#", "Azure DevOps"]),
+                new("Design solution architecture", "Define the application layers, domain boundaries, integration points, and deployment approach.", [".NET", "C#", "Azure"]),
+                new("Model core data structures", "Design the persistence model, database schema, and data access conventions for the solution.", [".NET", "C#", "SQL Server"])
+            ],
+            ["CoreFeatures"] =
+            [
+                new("Implement core business workflows", "Build the main user-facing workflows and application services required for the primary use case.", [".NET", "C#", "xUnit"]),
+                new("Add validation and business rules", "Implement input validation, domain rules, and error handling across the main feature set.", [".NET", "C#", "xUnit"]),
+                new("Integrate key external dependencies", "Connect the system to the required external APIs, hardware interfaces, or vendor libraries.", [".NET", "C#", "Azure"])
+            ],
+            ["ExperienceAndInterface"] =
+            [
+                new("Design primary application screens", "Define the main user interface layout, navigation, and interaction flow for the application.", [".NET", "C#", "React"]),
+                new("Implement user interface workflows", "Build the screens, forms, and interaction states required for day-to-day usage.", [".NET", "C#", "React"]),
+                new("Polish usability and visual feedback", "Improve accessibility, loading states, validation feedback, and overall user experience.", [".NET", "C#", "React"])
+            ],
+            ["TreeGrowthSystem"] =
+            [
+                new("Implement progression and growth logic", "Build the rules that govern progression, milestones, and state changes in the growth system.", [".NET", "C#", "xUnit"]),
+                new("Create visual growth feedback", "Develop the visual representation and update flow for the growth and progression experience.", [".NET", "C#", "React"]),
+                new("Add milestone and streak handling", "Implement milestone triggers, streak tracking, and special progression states.", [".NET", "C#", "xUnit"])
+            ],
+            ["CommunityPrivacySecurity"] =
+            [
+                new("Implement authentication and access control", "Add secure sign-in, authorization rules, and role-aware access handling.", [".NET", "C#", "Azure AD"]),
+                new("Build privacy and data protection flows", "Implement privacy rules, audit coverage, and controls for sensitive data handling.", [".NET", "C#", "SQL Server"]),
+                new("Add sharing and community safeguards", "Implement safe community views, moderation constraints, and anonymized data handling where needed.", [".NET", "C#", "Azure"])
+            ],
+            ["QualityTestingPmUx"] =
+            [
+                new("Set up automated testing and QA workflow", "Create the testing foundations for unit, integration, and regression coverage.", [".NET", "C#", "xUnit"]),
+                new("Run product and UX review cycle", "Validate the experience with PM and UX review feedback and capture follow-up changes.", [".NET", "C#", "Azure DevOps"]),
+                new("Prepare release hardening and rollout checks", "Complete release-readiness validation, monitoring preparation, and deployment verification.", [".NET", "C#", "Azure Monitor"])
+            ]
+        };
+
+        private static readonly List<RoadmapTemplate> CrossCuttingTemplates =
+        [
+            new("Add observability and operational telemetry", "Implement logging, monitoring, and diagnostics to support production operations.", [".NET", "C#", "Azure Monitor"]),
+            new("Prepare release readiness checklist", "Validate deployment safeguards, rollback plans, and release criteria before launch.", [".NET", "C#", "Azure DevOps"]),
+            new("Document support and maintenance procedures", "Capture support guidance, operational runbooks, and maintenance responsibilities.", [".NET", "C#", "Markdown"])
+        ];
+
         private readonly DecomposerAgent _decomposer;
         private readonly EstimatorAgent _estimator;
         private readonly IEstimationPolicy _estimationPolicy;
+        private readonly IProjectBriefPreprocessor _projectBriefPreprocessor;
         private readonly ILogger<AgentOrchestrator> _logger;
         private readonly int _maxEstimatorReworkCycles;
         private readonly int _minimumTasksPerWorkstream;
         private readonly EstimationPolicySettings _policySettings;
+        private readonly int _decomposerProjectContextMaxCharacters;
+        private readonly int _estimatorProjectContextMaxCharacters;
+        private readonly int _estimatorTaskDescriptionMaxCharacters;
+        private readonly int _estimatorFeedbackMaxCharacters;
 
         public AgentOrchestrator(
             DecomposerAgent decomposer,
             EstimatorAgent estimator,
             ValidatorAgent _,
             IEstimationPolicy estimationPolicy,
+            IProjectBriefPreprocessor projectBriefPreprocessor,
             IOptions<AiSettings> options,
             ILogger<AgentOrchestrator> logger)
         {
             _decomposer = decomposer;
             _estimator = estimator;
             _estimationPolicy = estimationPolicy;
+            _projectBriefPreprocessor = projectBriefPreprocessor;
             _logger = logger;
             _maxEstimatorReworkCycles = Math.Max(1, options.Value.MaxValidationCycles);
             _minimumTasksPerWorkstream = Math.Max(1, options.Value.EstimationPolicy.MinimumTasksPerWorkstream);
             _policySettings = options.Value.EstimationPolicy;
+            _decomposerProjectContextMaxCharacters = Math.Max(2000, options.Value.DecomposerProjectContextMaxCharacters);
+            _estimatorProjectContextMaxCharacters = Math.Max(1200, options.Value.EstimatorProjectContextMaxCharacters);
+            _estimatorTaskDescriptionMaxCharacters = Math.Max(80, options.Value.EstimatorTaskDescriptionMaxCharacters);
+            _estimatorFeedbackMaxCharacters = Math.Max(120, options.Value.EstimatorFeedbackMaxCharacters);
         }
 
         public async Task<ProjectEstimationResult> RunWorkflowAsync(
@@ -67,12 +120,19 @@ namespace Estimator.Core.Orchestrator
             CancellationToken cancellationToken = default)
         {
             var notes = new List<string>();
+            var preparedBrief = _projectBriefPreprocessor.Prepare(projectDescription);
+            if (preparedBrief.WasCondensed)
+            {
+                notes.Add(
+                    $"Input preparation: Condensed project description from {preparedBrief.OriginalCharacterCount} to {preparedBrief.PreparedCharacterCount} characters before agent processing.");
+            }
+
             var benchmark = _estimationPolicy.ResolveBenchmarkContext(projectDescription);
             var categoryBreakdown = new List<CategoryEstimateSummary>();
             var estimatorFeedback = string.Empty;
 
             var tasks = await DecomposeAsync(
-                projectDescription,
+                LimitForPrompt(preparedBrief.ModelInput, _decomposerProjectContextMaxCharacters),
                 $"Target benchmark profile: {benchmark.ProfileName}. Build full production roadmap once.",
                 benchmark,
                 cancellationToken);
@@ -81,7 +141,7 @@ namespace Estimator.Core.Orchestrator
 
             for (var cycle = 1; cycle <= _maxEstimatorReworkCycles; cycle++)
             {
-                var estimatedTasks = await EstimateAsync(projectDescription, tasks, estimatorFeedback, benchmark, cancellationToken);
+                var estimatedTasks = await EstimateAsync(preparedBrief.ModelInput, tasks, estimatorFeedback, benchmark, cancellationToken);
                 estimatedTasks = EnsureCoverageTasks(estimatedTasks, benchmark, notes, $"Estimator cycle {cycle}");
 
                 var normalization = _estimationPolicy.Normalize(estimatedTasks, projectDescription);
@@ -108,7 +168,7 @@ namespace Estimator.Core.Orchestrator
                 var validatorFeedback = ValidateEstimatesDeterministically(tasks, benchmark, categoryBreakdown);
                 if (validatorFeedback.IsValid)
                 {
-                    return BuildResult(projectDescription, tasks, cycle, notes, benchmark, categoryBreakdown);
+                    return BuildResult(preparedBrief.ProjectSummary, tasks, cycle, notes, benchmark, categoryBreakdown);
                 }
 
                 estimatorFeedback = BuildEstimatorFeedback(validatorFeedback, tasks);
@@ -119,7 +179,7 @@ namespace Estimator.Core.Orchestrator
             notes.Add("Max estimator rework cycles reached. Returning calibrated best-effort plan.");
             var finalNormalization = _estimationPolicy.Normalize(tasks, projectDescription);
             return BuildResult(
-                projectDescription,
+                preparedBrief.ProjectSummary,
                 EnsureTaskIds(finalNormalization.Tasks),
                 _maxEstimatorReworkCycles,
                 notes,
@@ -164,27 +224,8 @@ namespace Estimator.Core.Orchestrator
             BenchmarkContext benchmark,
             CancellationToken cancellationToken)
         {
-            var payload = new
-            {
-                project_description = projectDescription,
-                benchmark_profile = benchmark.ProfileName,
-                benchmark_total_hours = new
-                {
-                    minimum = benchmark.MinimumTotalHours,
-                    maximum = benchmark.MaximumTotalHours
-                },
-                benchmark_categories = benchmark.Workstreams.Select(workstream => new
-                {
-                    key = workstream.Key,
-                    name = workstream.Name,
-                    min_hours = workstream.MinHours,
-                    max_hours = workstream.MaxHours
-                }),
-                feedback = feedback ?? string.Empty,
-                tasks
-            };
-
-            var raw = await _estimator.ExecuteAsync(JsonSerializer.Serialize(payload, JsonOptions), cancellationToken);
+            var payload = BuildEstimatorPayload(projectDescription, tasks, feedback, benchmark);
+            var raw = await _estimator.ExecuteAsync(payload, cancellationToken);
             var estimatedTasks = EnsureTaskIds(ParseTasks(raw));
 
             if (estimatedTasks.Count == 0)
@@ -300,24 +341,14 @@ namespace Estimator.Core.Orchestrator
 
                 for (var index = 1; index <= missing; index++)
                 {
-                    tasks.Add(new ProjectTask
-                    {
-                        Title = $"{workstream.Name}: implementation {index}",
-                        Description = $"Production-grade work for {workstream.Name}. Focus areas: {string.Join(", ", workstream.Keywords.Take(4))}.",
-                        TechStack = [".NET", "C#", "Azure", "xUnit"]
-                    });
+                    tasks.Add(CreateCoverageTask(workstream, matched + index));
                     added++;
                 }
             }
 
             while (tasks.Count < benchmark.MinimumTaskCount)
             {
-                tasks.Add(new ProjectTask
-                {
-                    Title = "Cross-cutting production hardening",
-                    Description = "Add reliability, telemetry, release safeguards, and operational readiness.",
-                    TechStack = [".NET", "C#", "Azure Monitor", "xUnit"]
-                });
+                tasks.Add(CreateCrossCuttingTask(tasks.Count + 1));
                 added++;
             }
 
@@ -418,7 +449,10 @@ namespace Estimator.Core.Orchestrator
             var cleanJson = CleanJsonArray(rawResponse);
             try
             {
-                return JsonSerializer.Deserialize<List<ProjectTask>>(cleanJson, JsonOptions) ?? [];
+                return System.Text.Json.JsonSerializer.Deserialize<List<ProjectTask>>(cleanJson, new System.Text.Json.JsonSerializerOptions
+                {
+                    PropertyNameCaseInsensitive = true
+                }) ?? [];
             }
             catch
             {
@@ -433,12 +467,7 @@ namespace Estimator.Core.Orchestrator
             {
                 for (var index = 1; index <= _minimumTasksPerWorkstream; index++)
                 {
-                    tasks.Add(new ProjectTask
-                    {
-                        Title = $"{workstream.Name}: fallback task {index}",
-                        Description = $"Fallback production roadmap task for {workstream.Name}.",
-                        TechStack = [".NET", "C#", "Azure"]
-                    });
+                    tasks.Add(CreateCoverageTask(workstream, index));
                 }
             }
 
@@ -479,5 +508,139 @@ namespace Estimator.Core.Orchestrator
 
             return "[]";
         }
+
+        private ProjectTask CreateCoverageTask(BenchmarkWorkstreamContext workstream, int templateIndex)
+        {
+            var templates = ResolveTemplatesForWorkstream(workstream);
+            var template = templates[(Math.Max(templateIndex, 1) - 1) % templates.Count];
+
+            return new ProjectTask
+            {
+                Title = template.Title,
+                Description = template.Description,
+                TechStack = [.. template.TechStack]
+            };
+        }
+
+        private static List<RoadmapTemplate> ResolveTemplatesForWorkstream(BenchmarkWorkstreamContext workstream)
+        {
+            if (WorkstreamTemplates.TryGetValue(workstream.Key, out var templates) && templates.Count > 0)
+            {
+                return templates;
+            }
+
+            return
+            [
+                new(
+                    $"Plan {workstream.Name.ToLowerInvariant()} implementation",
+                    $"Plan and implement {workstream.Name.ToLowerInvariant()} with production-ready coverage for {string.Join(", ", workstream.Keywords.Take(4))}.",
+                    [".NET", "C#", "Azure"]),
+                new(
+                    $"Build {workstream.Name.ToLowerInvariant()} workflow",
+                    $"Deliver the main workflow for {workstream.Name.ToLowerInvariant()} and validate it end to end.",
+                    [".NET", "C#", "xUnit"])
+            ];
+        }
+
+        private static ProjectTask CreateCrossCuttingTask(int templateIndex)
+        {
+            var template = CrossCuttingTemplates[(Math.Max(templateIndex, 1) - 1) % CrossCuttingTemplates.Count];
+            return new ProjectTask
+            {
+                Title = template.Title,
+                Description = template.Description,
+                TechStack = [.. template.TechStack]
+            };
+        }
+
+        private string BuildEstimatorPayload(
+            string projectDescription,
+            IReadOnlyCollection<ProjectTask> tasks,
+            string? feedback,
+            BenchmarkContext benchmark)
+        {
+            var builder = new StringBuilder();
+            builder.AppendLine("Project context:");
+            builder.AppendLine(LimitForPrompt(projectDescription, _estimatorProjectContextMaxCharacters));
+            builder.AppendLine();
+            builder.AppendLine($"Benchmark profile: {benchmark.ProfileName}");
+            builder.AppendLine($"Target total hours: {benchmark.MinimumTotalHours}-{benchmark.MaximumTotalHours}");
+            builder.AppendLine("Category targets:");
+
+            foreach (var workstream in benchmark.Workstreams)
+            {
+                builder.AppendLine($"- {workstream.Name}: {workstream.MinHours}-{workstream.MaxHours}h");
+            }
+
+            if (!string.IsNullOrWhiteSpace(feedback))
+            {
+                builder.AppendLine();
+                builder.AppendLine($"Feedback: {LimitForPrompt(feedback, _estimatorFeedbackMaxCharacters)}");
+            }
+
+            builder.AppendLine();
+            builder.AppendLine("Tasks to estimate:");
+            foreach (var task in tasks.OrderBy(task => task.Id))
+            {
+                var description = LimitForPrompt(task.Description, _estimatorTaskDescriptionMaxCharacters);
+                var stack = task.TechStack
+                    .Where(item => !string.IsNullOrWhiteSpace(item))
+                    .Select(item => item.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Take(4);
+
+                builder.Append("- ");
+                builder.Append(task.Id);
+                builder.Append(". ");
+                builder.Append(task.Title);
+
+                if (!string.IsNullOrWhiteSpace(description))
+                {
+                    builder.Append(" | ");
+                    builder.Append(description);
+                }
+
+                var techStack = string.Join(", ", stack);
+                if (!string.IsNullOrWhiteSpace(techStack))
+                {
+                    builder.Append(" | Tech: ");
+                    builder.Append(techStack);
+                }
+
+                builder.AppendLine();
+            }
+
+            return builder.ToString().Trim();
+        }
+
+        private static string LimitForPrompt(string input, int maxCharacters)
+        {
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                return string.Empty;
+            }
+
+            var normalized = input.Trim();
+            maxCharacters = Math.Max(100, maxCharacters);
+            if (normalized.Length <= maxCharacters)
+            {
+                return normalized;
+            }
+
+            const string marker = " [...] ";
+            if (maxCharacters <= marker.Length + 20)
+            {
+                return normalized[..maxCharacters];
+            }
+
+            var headLength = (int)(maxCharacters * 0.8);
+            var tailLength = Math.Max(20, maxCharacters - headLength - marker.Length);
+            return string.Concat(
+                normalized.AsSpan(0, Math.Min(headLength, normalized.Length)),
+                marker,
+                normalized.AsSpan(Math.Max(0, normalized.Length - tailLength), Math.Min(tailLength, normalized.Length)));
+        }
+
+        private sealed record RoadmapTemplate(string Title, string Description, string[] TechStack);
     }
 }

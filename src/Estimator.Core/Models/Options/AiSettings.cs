@@ -19,6 +19,13 @@ namespace Estimator.Core.Models.Options
         public int RetryMaxPromptCharacters { get; set; } = 12000;
         public int DocumentMaxExtractedCharacters { get; set; } = 20000;
         public int DocumentRepeatedLineThreshold { get; set; } = 8;
+        public int ProjectBriefMaxCharacters { get; set; } = 12000;
+        public int ProjectBriefMaxUserStories { get; set; } = 20;
+        public int ProjectBriefMaxRequirementLines { get; set; } = 40;
+        public int DecomposerProjectContextMaxCharacters { get; set; } = 8000;
+        public int EstimatorProjectContextMaxCharacters { get; set; } = 4000;
+        public int EstimatorTaskDescriptionMaxCharacters { get; set; } = 140;
+        public int EstimatorFeedbackMaxCharacters { get; set; } = 400;
 
         public Dictionary<string, AgentRuntimeProfile> AgentRuntimeProfiles { get; set; } = CreateDefaultProfiles();
         public EstimationPolicySettings EstimationPolicy { get; set; } = new();

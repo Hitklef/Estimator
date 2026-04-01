@@ -66,6 +66,7 @@ namespace Estimator.Core.Services
                 var profile = ResolveProfile(role);
                 var prompt = BuildPrompt(systemPrompt, PrepareInput(userInput, _settings.MaxPromptCharacters));
                 var maxTokens = ResolveMaxTokens(prompt, profile.MaxTokens);
+                LogPromptBudget(role, prompt, maxTokens, profile.MaxTokens);
                 if (maxTokens <= 0)
                 {
                     throw ModelCapacityException.CreateDefault();
@@ -82,6 +83,7 @@ namespace Estimator.Core.Services
 
                     var retryPrompt = BuildPrompt(systemPrompt, PrepareInput(userInput, _settings.RetryMaxPromptCharacters));
                     var retryMaxTokens = ResolveMaxTokens(retryPrompt, Math.Min(profile.MaxTokens, 512));
+                    LogPromptBudget(role, retryPrompt, retryMaxTokens, Math.Min(profile.MaxTokens, 512), isRetry: true);
                     if (retryMaxTokens <= 0)
                     {
                         throw ModelCapacityException.CreateDefault(ex);
@@ -169,6 +171,23 @@ namespace Estimator.Core.Services
             }
 
             return (int)Math.Ceiling(content.Length / 4d);
+        }
+
+        private void LogPromptBudget(AgentRole role, string prompt, int resolvedMaxTokens, int requestedMaxTokens, bool isRetry = false)
+        {
+            var estimatedPromptTokens = EstimateTokens(prompt);
+            var contextSize = Math.Max(512, (int)_settings.ContextSize);
+            var available = Math.Max(0, contextSize - estimatedPromptTokens - Math.Max(64, _settings.ContextSafetyMarginTokens));
+            _logger.LogInformation(
+                "Prompt budget for role {Role}{RetryLabel}: chars={PromptChars}, estTokens={PromptTokens}, context={ContextSize}, available={AvailableTokens}, requestedOut={RequestedTokens}, resolvedOut={ResolvedTokens}",
+                role,
+                isRetry ? " (retry)" : string.Empty,
+                prompt.Length,
+                estimatedPromptTokens,
+                contextSize,
+                available,
+                requestedMaxTokens,
+                resolvedMaxTokens);
         }
 
         private static string PrepareInput(string input, int maxCharacters)

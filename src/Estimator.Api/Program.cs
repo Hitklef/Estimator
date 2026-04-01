@@ -25,6 +25,7 @@ try
     builder.Services.AddSingleton<EstimatorAgent>();
     builder.Services.AddSingleton<ValidatorAgent>();
     builder.Services.AddSingleton<IEstimationPolicy, EstimationPolicy>();
+    builder.Services.AddSingleton<IProjectBriefPreprocessor, ProjectBriefPreprocessor>();
     builder.Services.AddSingleton<AgentOrchestrator>();
     builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
 
