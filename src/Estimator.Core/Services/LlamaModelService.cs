@@ -17,7 +17,7 @@ namespace Estimator.Core.Services
         private readonly ILogger<LlamaModelService> _logger;
         private readonly LLamaWeights _weights;
         private readonly ModelParams _modelParams;
-        private StatelessExecutor _executor;
+        private readonly StatelessExecutor _executor;
         private readonly SemaphoreSlim _inferenceLock = new(1, 1);
         private bool _disposed;
 
@@ -57,56 +57,31 @@ namespace Estimator.Core.Services
             CancellationToken cancellationToken = default)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+
             using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeoutCts.CancelAfter(TimeSpan.FromSeconds(Math.Max(30, _settings.AgentInferenceTimeoutSeconds)));
 
             await _inferenceLock.WaitAsync(timeoutCts.Token);
             try
             {
-                var profile = ResolveProfile(role);
-                var prompt = BuildPrompt(systemPrompt, PrepareInput(userInput, _settings.MaxPromptCharacters));
-                var maxTokens = ResolveMaxTokens(prompt, profile.MaxTokens);
-                LogPromptBudget(role, prompt, maxTokens, profile.MaxTokens);
-                if (maxTokens <= 0)
-                {
-                    throw ModelCapacityException.CreateDefault();
-                }
+                var profile = _settings.ResolveProfile(role.ToString());
+                var prompt = BuildPrompt(systemPrompt, userInput);
+                var inference = CreateInferenceParams(profile);
 
-                try
-                {
-                    return await InferInternalAsync(prompt, CreateInferenceParams(profile, maxTokens), timeoutCts.Token);
-                }
-                catch (LLamaDecodeError ex) when (IsNoKvSlot(ex))
-                {
-                    _logger.LogWarning(ex, "Encountered NoKvSlot for role {Role}. Retrying with a fresh executor and tighter prompt budget.", role);
-                    RecreateExecutor();
-
-                    var retryPrompt = BuildPrompt(systemPrompt, PrepareInput(userInput, _settings.RetryMaxPromptCharacters));
-                    var retryMaxTokens = ResolveMaxTokens(retryPrompt, Math.Min(profile.MaxTokens, 512));
-                    LogPromptBudget(role, retryPrompt, retryMaxTokens, Math.Min(profile.MaxTokens, 512), isRetry: true);
-                    if (retryMaxTokens <= 0)
-                    {
-                        throw ModelCapacityException.CreateDefault(ex);
-                    }
-
-                    try
-                    {
-                        return await InferInternalAsync(retryPrompt, CreateInferenceParams(profile, retryMaxTokens), timeoutCts.Token);
-                    }
-                    catch (LLamaDecodeError retryEx) when (IsNoKvSlot(retryEx))
-                    {
-                        throw ModelCapacityException.CreateDefault(retryEx);
-                    }
-                }
-                catch (Exception ex) when (IsNoKvSlotMessage(ex.Message))
-                {
-                    throw ModelCapacityException.CreateDefault(ex);
-                }
+                return await InferInternalAsync(prompt, inference, timeoutCts.Token);
+            }
+            catch (LLamaDecodeError ex) when (IsNoKvSlot(ex))
+            {
+                throw ModelCapacityException.CreateDefault(ex);
+            }
+            catch (Exception ex) when (IsNoKvSlotMessage(ex.Message))
+            {
+                throw ModelCapacityException.CreateDefault(ex);
             }
             catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {
                 _logger.LogWarning(
-                    "Inference timed out for role {Role} after {TimeoutSeconds}s. Returning empty response for fallback handling.",
+                    "Inference timed out for role {Role} after {TimeoutSeconds}s.",
                     role,
                     _settings.AgentInferenceTimeoutSeconds);
                 return string.Empty;
@@ -117,15 +92,10 @@ namespace Estimator.Core.Services
             }
         }
 
-        private AgentRuntimeProfile ResolveProfile(AgentRole role)
-        {
-            return _settings.ResolveProfile(role.ToString());
-        }
-
-        private static InferenceParams CreateInferenceParams(AgentRuntimeProfile profile, int maxTokens) =>
+        private static InferenceParams CreateInferenceParams(AgentRuntimeProfile profile) =>
             new()
             {
-                MaxTokens = maxTokens,
+                MaxTokens = profile.MaxTokens,
                 AntiPrompts = profile.AntiPrompts.ToArray(),
                 SamplingPipeline = new DefaultSamplingPipeline
                 {
@@ -134,8 +104,11 @@ namespace Estimator.Core.Services
                 }
             };
 
-        private static string BuildPrompt(string systemPrompt, string userInput) =>
-            $"<|im_start|>system\n{systemPrompt}<|im_end|>\n<|im_start|>user\n{userInput}<|im_end|>\n<|im_start|>assistant\n";
+        private static string BuildPrompt(string systemPrompt, string userInput)
+        {
+            var input = userInput ?? string.Empty;
+            return $"<|im_start|>system\n{systemPrompt}<|im_end|>\n<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n";
+        }
 
         private async Task<string> InferInternalAsync(string prompt, InferenceParams inference, CancellationToken cancellationToken)
         {
@@ -148,90 +121,12 @@ namespace Estimator.Core.Services
             return builder.ToString().Trim();
         }
 
-        private int ResolveMaxTokens(string prompt, int requestedMaxTokens)
-        {
-            var contextSize = Math.Max(512, (int)_settings.ContextSize);
-            var safetyMargin = Math.Max(64, _settings.ContextSafetyMarginTokens);
-            var minimumGenerationTokens = Math.Max(64, _settings.MinimumGenerationTokens);
-            var estimatedPromptTokens = EstimateTokens(prompt);
-            var availableForGeneration = contextSize - estimatedPromptTokens - safetyMargin;
-            if (availableForGeneration < minimumGenerationTokens)
-            {
-                return 0;
-            }
-
-            return Math.Max(64, Math.Min(requestedMaxTokens, availableForGeneration));
-        }
-
-        private static int EstimateTokens(string content)
-        {
-            if (string.IsNullOrWhiteSpace(content))
-            {
-                return 0;
-            }
-
-            return (int)Math.Ceiling(content.Length / 4d);
-        }
-
-        private void LogPromptBudget(AgentRole role, string prompt, int resolvedMaxTokens, int requestedMaxTokens, bool isRetry = false)
-        {
-            var estimatedPromptTokens = EstimateTokens(prompt);
-            var contextSize = Math.Max(512, (int)_settings.ContextSize);
-            var available = Math.Max(0, contextSize - estimatedPromptTokens - Math.Max(64, _settings.ContextSafetyMarginTokens));
-            _logger.LogInformation(
-                "Prompt budget for role {Role}{RetryLabel}: chars={PromptChars}, estTokens={PromptTokens}, context={ContextSize}, available={AvailableTokens}, requestedOut={RequestedTokens}, resolvedOut={ResolvedTokens}",
-                role,
-                isRetry ? " (retry)" : string.Empty,
-                prompt.Length,
-                estimatedPromptTokens,
-                contextSize,
-                available,
-                requestedMaxTokens,
-                resolvedMaxTokens);
-        }
-
-        private static string PrepareInput(string input, int maxCharacters)
-        {
-            if (string.IsNullOrWhiteSpace(input))
-            {
-                return string.Empty;
-            }
-
-            var normalized = input
-                .Replace("\0", string.Empty, StringComparison.Ordinal)
-                .Trim();
-
-            maxCharacters = Math.Max(1000, maxCharacters);
-            if (normalized.Length <= maxCharacters)
-            {
-                return normalized;
-            }
-
-            const string marker = "\n\n[... input truncated for model context ...]\n\n";
-            if (maxCharacters <= marker.Length + 200)
-            {
-                return normalized[..maxCharacters];
-            }
-
-            var headLength = (int)(maxCharacters * 0.75);
-            var tailLength = Math.Max(80, maxCharacters - headLength - marker.Length);
-            var head = normalized[..Math.Min(headLength, normalized.Length)];
-            var tailStart = Math.Max(0, normalized.Length - tailLength);
-            var tail = normalized[tailStart..];
-            return $"{head}{marker}{tail}";
-        }
-
         private static bool IsNoKvSlot(LLamaDecodeError exception) =>
             exception.Message.Contains("NoKvSlot", StringComparison.OrdinalIgnoreCase);
 
         private static bool IsNoKvSlotMessage(string? message) =>
             !string.IsNullOrWhiteSpace(message) &&
             message.Contains("NoKvSlot", StringComparison.OrdinalIgnoreCase);
-
-        private void RecreateExecutor()
-        {
-            _executor = new StatelessExecutor(_weights, _modelParams);
-        }
 
         public void Dispose()
         {
