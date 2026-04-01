@@ -62,6 +62,8 @@ BenchmarkDotNet.Artifacts/
 project.lock.json
 project.fragment.lock.json
 artifacts/
+temp-build/
+src/**/internal-nlog.txt
 
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
