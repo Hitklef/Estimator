@@ -4,6 +4,7 @@ using Estimator.Core.Models;
 using Estimator.Core.Models.Options;
 using Estimator.Core.Orchestrator;
 using Estimator.Core.Services;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,6 +17,7 @@ builder.Services.AddSingleton<EstimatorAgent>();
 builder.Services.AddSingleton<ValidatorAgent>();
 builder.Services.AddSingleton<AgentOrchestrator>();
 builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
+builder.Services.AddSingleton<IEstimateSessionStore, InMemoryEstimateSessionStore>();
 
 var app = builder.Build();
 
@@ -77,21 +79,137 @@ app.Use(async (context, next) =>
     }
 });
 
-app.MapPost("/estimate", async (ProjectRequest request, AgentOrchestrator orchestrator, CancellationToken cancellationToken) =>
+app.MapPost("/estimate", async (
+    EstimateRequest request,
+    IEstimateSessionStore sessionStore,
+    AgentOrchestrator orchestrator,
+    IOptions<AiSettings> options,
+    CancellationToken cancellationToken) =>
 {
-    if (string.IsNullOrWhiteSpace(request.Description))
+    var hasSessionId = !string.IsNullOrWhiteSpace(request.SessionId);
+    var hasDescription = !string.IsNullOrWhiteSpace(request.Description);
+    var hasAnswer = !string.IsNullOrWhiteSpace(request.Answer);
+
+    if (!hasSessionId && !hasDescription)
     {
-        return Results.BadRequest(new { status = "Error", message = "Description is required." });
+        return Results.BadRequest(new
+        {
+            status = "Error",
+            message = "Description is required for a new session."
+        });
     }
 
-    var plan = await orchestrator.RunWorkflowAsync(request.Description, cancellationToken);
-    return Results.Ok(new { status = "Success", data = plan });
+    if (!hasSessionId && hasAnswer)
+    {
+        return Results.BadRequest(new
+        {
+            status = "Error",
+            message = "Answer requires an existing session_id."
+        });
+    }
+
+    WorkflowSession session;
+    if (hasSessionId)
+    {
+        if (!sessionStore.TryGet(request.SessionId!, out var existingSession) || existingSession is null)
+        {
+            return Results.BadRequest(new
+            {
+                status = "Error",
+                message = "Session not found or expired. Start a new request with description."
+            });
+        }
+
+        session = existingSession;
+
+        if (hasDescription)
+        {
+            var incomingDescription = request.Description!.Trim();
+            if (!session.ProjectDescription.Equals(incomingDescription, StringComparison.Ordinal))
+            {
+                return Results.BadRequest(new
+                {
+                    status = "Error",
+                    message = "Description cannot be changed for an existing session."
+                });
+            }
+        }
+    }
+    else
+    {
+        session = sessionStore.Create(request.Description!);
+    }
+
+    if (session.Result is not null)
+    {
+        return Results.Ok(new
+        {
+            status = "Success",
+            session_id = session.SessionId,
+            data = session.Result
+        });
+    }
+
+    if (string.IsNullOrWhiteSpace(request.Answer) && !string.IsNullOrWhiteSpace(session.PendingQuestion))
+    {
+        return Results.Ok(new
+        {
+            status = "NeedsClarification",
+            session_id = session.SessionId,
+            question = session.PendingQuestion,
+            clarification_round = session.QuestionsAsked,
+            max_clarification_rounds = Math.Max(1, options.Value.MaxClarificationRounds)
+        });
+    }
+
+    if (hasAnswer)
+    {
+        if (string.IsNullOrWhiteSpace(session.PendingQuestion))
+        {
+            return Results.BadRequest(new
+            {
+                status = "Error",
+                message = "No pending clarification question for this session."
+            });
+        }
+
+        session.Clarifications.Add(new ClarificationExchange
+        {
+            Question = session.PendingQuestion,
+            Answer = request.Answer!.Trim()
+        });
+        session.PendingQuestion = null;
+    }
+
+    var step = await orchestrator.RunSessionAsync(session, cancellationToken);
+    sessionStore.Save(session);
+
+    if (step.Status == WorkflowStepStatus.NeedsClarification)
+    {
+        return Results.Ok(new
+        {
+            status = "NeedsClarification",
+            session_id = session.SessionId,
+            question = step.Question,
+            clarification_round = session.QuestionsAsked,
+            max_clarification_rounds = Math.Max(1, options.Value.MaxClarificationRounds)
+        });
+    }
+
+    return Results.Ok(new
+    {
+        status = "Success",
+        session_id = session.SessionId,
+        data = step.Result
+    });
 });
 
 app.MapPost("/estimate/document", async (
     HttpRequest request,
     IDocumentTextExtractor extractor,
+    IEstimateSessionStore sessionStore,
     AgentOrchestrator orchestrator,
+    IOptions<AiSettings> options,
     CancellationToken cancellationToken) =>
 {
     if (!request.HasFormContentType)
@@ -121,17 +239,39 @@ app.MapPost("/estimate/document", async (
         return Results.BadRequest(new { status = "Error", message = extraction.Error });
     }
 
-    var plan = await orchestrator.RunWorkflowAsync(extraction.Text, cancellationToken);
+    var session = sessionStore.Create(extraction.Text);
+    var step = await orchestrator.RunSessionAsync(session, cancellationToken);
+    sessionStore.Save(session);
+
+    if (step.Status == WorkflowStepStatus.NeedsClarification)
+    {
+        return Results.Ok(new
+        {
+            status = "NeedsClarification",
+            session_id = session.SessionId,
+            question = step.Question,
+            clarification_round = session.QuestionsAsked,
+            max_clarification_rounds = Math.Max(1, options.Value.MaxClarificationRounds),
+            source = new
+            {
+                file_name = file.FileName,
+                file_extension = extraction.FileExtension,
+                extracted_characters = extraction.Text.Length
+            }
+        });
+    }
+
     return Results.Ok(new
     {
         status = "Success",
+        session_id = session.SessionId,
         source = new
         {
             file_name = file.FileName,
             file_extension = extraction.FileExtension,
             extracted_characters = extraction.Text.Length
         },
-        data = plan
+        data = step.Result
     });
 })
 .Accepts<IFormFile>("multipart/form-data")
@@ -139,4 +279,4 @@ app.MapPost("/estimate/document", async (
 
 app.Run();
 
-public sealed record ProjectRequest(string Description);
+public sealed record EstimateRequest(string? Description, string? SessionId, string? Answer);

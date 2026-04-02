@@ -1,12 +1,21 @@
 @Estimator.Api_HostAddress = https://localhost:7121
 
+### 1) Start estimation session from plain description
 POST {{Estimator.Api_HostAddress}}/estimate
 Content-Type: application/json
 
 {
-  "description": "Build a .NET app with onboarding, daily check-ins, and privacy-first community features."
+  "description": "Build a .NET application for transceiver EEPROM read/write with offline sync and audit trail."
 }
 
-###
+### 2) Continue session with clarification answer (replace session_id)
+POST {{Estimator.Api_HostAddress}}/estimate
+Content-Type: application/json
 
-# Use Postman or curl for /estimate/document (multipart/form-data with file field name: file)
+{
+  "sessionId": "replace_with_session_id",
+  "answer": "Phase 1 must support only SFP/SFP+ and local USB coding box."
+}
+
+### 3) Start estimation from document
+# Use multipart/form-data with key: file

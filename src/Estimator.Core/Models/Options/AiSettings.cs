@@ -13,6 +13,8 @@ namespace Estimator.Core.Models.Options
         public int DownloadTimeoutMinutes { get; set; } = 30;
         public int AgentInferenceTimeoutSeconds { get; set; } = 120;
         public int MaxValidationCycles { get; set; } = 3;
+        public int MaxClarificationRounds { get; set; } = 3;
+        public int SessionTtlMinutes { get; set; } = 180;
 
         public Dictionary<string, AgentRuntimeProfile> AgentRuntimeProfiles { get; set; } = CreateDefaultProfiles();
 

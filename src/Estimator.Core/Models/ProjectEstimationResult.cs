@@ -22,5 +22,8 @@ namespace Estimator.Core.Models
 
         [JsonPropertyName("validation_notes")]
         public List<string> ValidationNotes { get; init; } = new();
+
+        [JsonPropertyName("clarification_history")]
+        public List<ClarificationExchange> ClarificationHistory { get; init; } = new();
     }
 }
