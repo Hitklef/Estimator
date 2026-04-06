@@ -21,6 +21,7 @@ namespace Estimator.Core.Orchestrator
         private readonly ILogger<AgentOrchestrator> _logger;
         private readonly int _maxValidationCycles;
         private readonly int _maxClarificationRounds;
+        private readonly int _projectContextMaxCharacters;
 
         public AgentOrchestrator(
             DecomposerAgent decomposer,
@@ -35,6 +36,7 @@ namespace Estimator.Core.Orchestrator
             _logger = logger;
             _maxValidationCycles = Math.Max(1, options.Value.MaxValidationCycles);
             _maxClarificationRounds = Math.Max(1, options.Value.MaxClarificationRounds);
+            _projectContextMaxCharacters = Math.Max(2000, options.Value.DecomposerProjectContextMaxCharacters);
         }
 
         public async Task<WorkflowStepResult> RunSessionAsync(
@@ -80,7 +82,8 @@ namespace Estimator.Core.Orchestrator
                 var validatorInput = BuildValidatorInput(
                     session.ProjectDescription,
                     session.Clarifications,
-                    estimatedTasks);
+                    estimatedTasks,
+                    _projectContextMaxCharacters);
 
                 var validatorRaw = await _validator.ExecuteAsync(validatorInput, cancellationToken);
                 var feedback = ParseValidatorFeedback(validatorRaw);
@@ -149,7 +152,8 @@ namespace Estimator.Core.Orchestrator
                 session.Clarifications,
                 session.QuestionsAsked,
                 canAskMoreQuestions,
-                forceFinalize: false);
+                forceFinalize: false,
+                projectContextMaxCharacters: _projectContextMaxCharacters);
 
             var raw = await _decomposer.ExecuteAsync(input, cancellationToken);
             var decision = ParseDecomposerDecision(raw);
@@ -161,7 +165,8 @@ namespace Estimator.Core.Orchestrator
                     session.Clarifications,
                     session.QuestionsAsked,
                     canAskMoreQuestions: false,
-                    forceFinalize: true);
+                    forceFinalize: true,
+                    projectContextMaxCharacters: _projectContextMaxCharacters);
 
                 var forcedRaw = await _decomposer.ExecuteAsync(forcedInput, cancellationToken);
                 decision = ParseDecomposerDecision(forcedRaw);
@@ -185,7 +190,8 @@ namespace Estimator.Core.Orchestrator
                         session.Clarifications,
                         session.QuestionsAsked,
                         canAskMoreQuestions: false,
-                        forceFinalize: true);
+                        forceFinalize: true,
+                        projectContextMaxCharacters: _projectContextMaxCharacters);
 
                     var forcedRaw = await _decomposer.ExecuteAsync(forcedInput, cancellationToken);
                     decision = ParseDecomposerDecision(forcedRaw);
@@ -212,7 +218,12 @@ namespace Estimator.Core.Orchestrator
             ValidatorFeedback? validatorFeedback,
             CancellationToken cancellationToken)
         {
-            var estimatorInput = BuildEstimatorInput(projectDescription, clarifications, tasks, validatorFeedback);
+            var estimatorInput = BuildEstimatorInput(
+                projectDescription,
+                clarifications,
+                tasks,
+                validatorFeedback,
+                _projectContextMaxCharacters);
             var estimatorRaw = await _estimator.ExecuteAsync(estimatorInput, cancellationToken);
             return ParseTasksOrThrow(estimatorRaw, "Estimator");
         }
@@ -222,11 +233,14 @@ namespace Estimator.Core.Orchestrator
             IReadOnlyCollection<ClarificationExchange> clarifications,
             int questionsAsked,
             bool canAskMoreQuestions,
-            bool forceFinalize)
+            bool forceFinalize,
+            int projectContextMaxCharacters)
         {
+            var boundedDescription = LimitText(projectDescription, projectContextMaxCharacters);
+
             var builder = new StringBuilder();
             builder.AppendLine("Project description:");
-            builder.AppendLine(projectDescription);
+            builder.AppendLine(boundedDescription);
             builder.AppendLine();
             builder.AppendLine("Clarification history (JSON):");
             builder.AppendLine(JsonSerializer.Serialize(clarifications, SerializerOptions));
@@ -249,11 +263,14 @@ namespace Estimator.Core.Orchestrator
             string projectDescription,
             IReadOnlyCollection<ClarificationExchange> clarifications,
             IReadOnlyCollection<ProjectTask> tasks,
-            ValidatorFeedback? validatorFeedback)
+            ValidatorFeedback? validatorFeedback,
+            int projectContextMaxCharacters)
         {
+            var boundedDescription = LimitText(projectDescription, projectContextMaxCharacters);
+
             var builder = new StringBuilder();
             builder.AppendLine("Project description:");
-            builder.AppendLine(projectDescription);
+            builder.AppendLine(boundedDescription);
             builder.AppendLine();
             builder.AppendLine("Clarification history (JSON):");
             builder.AppendLine(JsonSerializer.Serialize(clarifications, SerializerOptions));
@@ -274,11 +291,14 @@ namespace Estimator.Core.Orchestrator
         private static string BuildValidatorInput(
             string projectDescription,
             IReadOnlyCollection<ClarificationExchange> clarifications,
-            IReadOnlyCollection<ProjectTask> estimatedTasks)
+            IReadOnlyCollection<ProjectTask> estimatedTasks,
+            int projectContextMaxCharacters)
         {
+            var boundedDescription = LimitText(projectDescription, projectContextMaxCharacters);
+
             var builder = new StringBuilder();
             builder.AppendLine("Project description:");
-            builder.AppendLine(projectDescription);
+            builder.AppendLine(boundedDescription);
             builder.AppendLine();
             builder.AppendLine("Clarification history (JSON):");
             builder.AppendLine(JsonSerializer.Serialize(clarifications, SerializerOptions));
@@ -286,6 +306,24 @@ namespace Estimator.Core.Orchestrator
             builder.AppendLine("Estimated roadmap tasks (JSON):");
             builder.AppendLine(JsonSerializer.Serialize(estimatedTasks, SerializerOptions));
             return builder.ToString();
+        }
+
+        private static string LimitText(string value, int maxCharacters)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            var normalized = value.Trim();
+            if (maxCharacters <= 0 || normalized.Length <= maxCharacters)
+            {
+                return normalized;
+            }
+
+            var truncatedCharacters = normalized.Length - maxCharacters;
+            return normalized[..maxCharacters] +
+                   $"\n\n[Input truncated by orchestrator. Removed {truncatedCharacters} trailing characters.]";
         }
 
         private static DecomposerDecision ParseDecomposerDecision(string rawResponse)

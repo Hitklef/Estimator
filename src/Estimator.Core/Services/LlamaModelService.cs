@@ -28,26 +28,48 @@ namespace Estimator.Core.Services
 
             _logger.LogInformation("Initializing LLM engine. Model: {ModelPath}", _settings.LocalModelPath);
 
-            _modelParams = new ModelParams(_settings.LocalModelPath)
+            Exception? lastRetryableError = null;
+            foreach (var gpuLayerCandidate in BuildGpuLayerCandidates(_settings.GpuLayerCount))
             {
-                ContextSize = _settings.ContextSize,
-                GpuLayerCount = _settings.GpuLayerCount,
-                MainGpu = 0,
-                UseMemoryLock = false,
-                UseMemorymap = true
-            };
+                var candidateParams = new ModelParams(_settings.LocalModelPath)
+                {
+                    ContextSize = _settings.ContextSize,
+                    GpuLayerCount = gpuLayerCandidate,
+                    MainGpu = 0,
+                    UseMemoryLock = false,
+                    UseMemorymap = true
+                };
 
-            try
-            {
-                _weights = LLamaWeights.LoadFromFile(_modelParams);
-                _executor = new StatelessExecutor(_weights, _modelParams);
-                _logger.LogInformation("LLM engine loaded successfully.");
+                try
+                {
+                    _weights = LLamaWeights.LoadFromFile(candidateParams);
+                    _modelParams = candidateParams;
+                    _executor = new StatelessExecutor(_weights, _modelParams);
+
+                    _logger.LogInformation(
+                        "LLM engine loaded successfully. ContextSize={ContextSize}, GpuLayerCount={GpuLayers}",
+                        _settings.ContextSize,
+                        gpuLayerCandidate);
+
+                    return;
+                }
+                catch (Exception ex) when (ShouldRetryWithFewerGpuLayers(ex) && gpuLayerCandidate > 0)
+                {
+                    lastRetryableError = ex;
+                    _logger.LogWarning(
+                        ex,
+                        "Model load failed with GpuLayerCount={GpuLayers}. Retrying with fewer GPU layers.",
+                        gpuLayerCandidate);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogCritical(ex, "Failed to initialize LLM engine.");
+                    throw;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogCritical(ex, "Failed to initialize LLM engine.");
-                throw;
-            }
+
+            _logger.LogCritical(lastRetryableError, "Failed to initialize LLM engine after GPU-layer fallback attempts.");
+            throw new InvalidOperationException("Failed to initialize Gemma 4 model with current GPU/CPU memory settings.", lastRetryableError);
         }
 
         public async Task<string> CompleteAsync(
@@ -106,8 +128,10 @@ namespace Estimator.Core.Services
 
         private static string BuildPrompt(string systemPrompt, string userInput)
         {
-            var input = userInput ?? string.Empty;
-            return $"<|im_start|>system\n{systemPrompt}<|im_end|>\n<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n";
+            var system = systemPrompt?.Trim() ?? string.Empty;
+            var input = userInput?.Trim() ?? string.Empty;
+
+            return $"<bos><|turn>system\n{system}<turn|>\n<|turn>user\n{input}<turn|>\n<|turn>model\n";
         }
 
         private async Task<string> InferInternalAsync(string prompt, InferenceParams inference, CancellationToken cancellationToken)
@@ -119,6 +143,36 @@ namespace Estimator.Core.Services
             }
 
             return builder.ToString().Trim();
+        }
+
+        private static IEnumerable<int> BuildGpuLayerCandidates(int requestedLayers)
+        {
+            var layers = Math.Max(0, requestedLayers);
+            yield return layers;
+
+            for (var candidate = layers - 4; candidate > 0; candidate -= 4)
+            {
+                yield return candidate;
+            }
+
+            if (layers != 0)
+            {
+                yield return 0;
+            }
+        }
+
+        private static bool ShouldRetryWithFewerGpuLayers(Exception exception)
+        {
+            var message = exception.ToString();
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return false;
+            }
+
+            return message.Contains("cuda", StringComparison.OrdinalIgnoreCase) &&
+                   (message.Contains("out of memory", StringComparison.OrdinalIgnoreCase) ||
+                    message.Contains("not enough memory", StringComparison.OrdinalIgnoreCase) ||
+                    message.Contains("alloc", StringComparison.OrdinalIgnoreCase));
         }
 
         private static bool IsNoKvSlot(LLamaDecodeError exception) =>

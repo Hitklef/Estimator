@@ -16,4 +16,8 @@
     <ProjectReference Include="..\Estimator.Core\Estimator.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Content Include="Runtime\**\*.*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

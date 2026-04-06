@@ -11,7 +11,19 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<AiSettings>(builder.Configuration.GetSection(AiSettings.SectionName));
 
 builder.Services.AddSingleton<ModelManager>();
-builder.Services.AddSingleton<IAgentModelGateway, LlamaModelService>();
+builder.Services.AddSingleton<LlamaModelService>();
+builder.Services.AddSingleton<LlamaCppServerManager>();
+builder.Services.AddSingleton<LlamaCppHttpModelService>();
+builder.Services.AddSingleton<IAgentModelGateway>(provider =>
+{
+    var settings = provider.GetRequiredService<IOptions<AiSettings>>().Value;
+    if (settings.UseLlamaCppServer)
+    {
+        return provider.GetRequiredService<LlamaCppHttpModelService>();
+    }
+
+    return provider.GetRequiredService<LlamaModelService>();
+});
 builder.Services.AddSingleton<DecomposerAgent>();
 builder.Services.AddSingleton<EstimatorAgent>();
 builder.Services.AddSingleton<ValidatorAgent>();
@@ -20,6 +32,13 @@ builder.Services.AddSingleton<IDocumentTextExtractor, DocumentTextExtractor>();
 builder.Services.AddSingleton<IEstimateSessionStore, InMemoryEstimateSessionStore>();
 
 var app = builder.Build();
+
+var runtimeSettings = app.Services.GetRequiredService<IOptions<AiSettings>>().Value;
+if (runtimeSettings.UseLlamaCppServer)
+{
+    var serverManager = app.Services.GetRequiredService<LlamaCppServerManager>();
+    app.Lifetime.ApplicationStopping.Register(serverManager.Stop);
+}
 
 using (var scope = app.Services.CreateScope())
 {
@@ -49,6 +68,34 @@ app.Use(async (context, next) =>
             });
         }
     }
+    catch (ModelInferenceTimeoutException ex)
+    {
+        app.Logger.LogWarning(ex, "Model inference timed out while processing request.");
+        if (!context.Response.HasStarted)
+        {
+            context.Response.StatusCode = StatusCodes.Status408RequestTimeout;
+            await context.Response.WriteAsJsonAsync(new
+            {
+                status = "Error",
+                code = ModelInferenceTimeoutException.ErrorCode,
+                message = ex.Message
+            });
+        }
+    }
+    catch (OperationCanceledException ex) when (!context.RequestAborted.IsCancellationRequested)
+    {
+        app.Logger.LogWarning(ex, "Request processing timed out.");
+        if (!context.Response.HasStarted)
+        {
+            context.Response.StatusCode = StatusCodes.Status408RequestTimeout;
+            await context.Response.WriteAsJsonAsync(new
+            {
+                status = "Error",
+                code = ModelInferenceTimeoutException.ErrorCode,
+                message = ModelInferenceTimeoutException.DefaultMessage
+            });
+        }
+    }
     catch (InvalidOperationException ex)
     {
         app.Logger.LogWarning(ex, "Agent response could not be processed.");
@@ -74,6 +121,19 @@ app.Use(async (context, next) =>
                 status = "Error",
                 code = ModelCapacityException.ErrorCode,
                 message = ModelCapacityException.DefaultMessage
+            });
+        }
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "Unhandled request error.");
+        if (!context.Response.HasStarted)
+        {
+            context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+            await context.Response.WriteAsJsonAsync(new
+            {
+                status = "Error",
+                message = "Unexpected server error during AI processing. Please retry."
             });
         }
     }
