@@ -13,9 +13,11 @@ namespace Estimator.Core.Models.Options
         public int LlamaCppServerPort { get; set; } = 8089;
         public string LlamaCppServerAdditionalArgs { get; set; } = string.Empty;
         public bool LlamaCppServerAutoDownloadRuntime { get; set; } = true;
-        public int LlamaCppPerAttemptTimeoutSeconds { get; set; } = 120;
-        public int LlamaCppMaxInferenceAttempts { get; set; } = 2;
+        public int LlamaCppPerAttemptTimeoutSeconds { get; set; } = 0;
+        public int LlamaCppMaxInferenceAttempts { get; set; } = 1;
         public bool LlamaCppRestartServerOnTimeout { get; set; } = true;
+        public int LlamaCppSafetyTimeoutSeconds { get; set; } = 900;
+        public bool EnableDetailedDiagnostics { get; set; } = true;
         public string LlamaCppServerRuntimeUrl { get; set; } =
             "https://github.com/ggml-org/llama.cpp/releases/download/b8672/llama-b8672-bin-win-cuda-12.4-x64.zip";
 
@@ -23,7 +25,9 @@ namespace Estimator.Core.Models.Options
         public int GpuLayerCount { get; set; } = 20;
         public int DownloadTimeoutMinutes { get; set; } = 120;
         public int AgentInferenceTimeoutSeconds { get; set; } = 300;
+        public int WorkflowTimeoutSeconds { get; set; } = 0;
         public int DecomposerProjectContextMaxCharacters { get; set; } = 12000;
+        public int MaxDecomposerCallsPerSession { get; set; } = 5;
         public int ProjectContextMaxCharacters
         {
             get => DecomposerProjectContextMaxCharacters;

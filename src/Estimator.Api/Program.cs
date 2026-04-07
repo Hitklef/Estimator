@@ -48,6 +48,37 @@ using (var scope = app.Services.CreateScope())
 
 app.UseHttpsRedirection();
 
+static CancellationTokenSource CreateWorkflowTimeoutCts(CancellationToken requestToken, int workflowTimeoutSeconds)
+{
+    var linked = CancellationTokenSource.CreateLinkedTokenSource(requestToken);
+    if (workflowTimeoutSeconds > 0)
+    {
+        linked.CancelAfter(TimeSpan.FromSeconds(workflowTimeoutSeconds));
+    }
+
+    return linked;
+}
+
+app.Use(async (context, next) =>
+{
+    var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+    var requestId = context.TraceIdentifier;
+    app.Logger.LogInformation(
+        "Request started. RequestId={RequestId} Method={Method} Path={Path}",
+        requestId,
+        context.Request.Method,
+        context.Request.Path);
+
+    await next();
+
+    stopwatch.Stop();
+    app.Logger.LogInformation(
+        "Request completed. RequestId={RequestId} StatusCode={StatusCode} DurationMs={DurationMs}",
+        requestId,
+        context.Response.StatusCode,
+        stopwatch.ElapsedMilliseconds);
+});
+
 app.Use(async (context, next) =>
 {
     try
@@ -95,6 +126,10 @@ app.Use(async (context, next) =>
                 message = ModelInferenceTimeoutException.DefaultMessage
             });
         }
+    }
+    catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+    {
+        app.Logger.LogInformation("Request aborted by client.");
     }
     catch (InvalidOperationException ex)
     {
@@ -218,7 +253,7 @@ app.MapPost("/estimate", async (
             session_id = session.SessionId,
             question = session.PendingQuestion,
             clarification_round = session.QuestionsAsked,
-            max_clarification_rounds = Math.Max(1, options.Value.MaxClarificationRounds)
+            max_clarification_rounds = Math.Max(0, options.Value.MaxClarificationRounds)
         });
     }
 
@@ -241,7 +276,9 @@ app.MapPost("/estimate", async (
         session.PendingQuestion = null;
     }
 
-    var step = await orchestrator.RunSessionAsync(session, cancellationToken);
+    using var workflowTimeoutCts = CreateWorkflowTimeoutCts(cancellationToken, options.Value.WorkflowTimeoutSeconds);
+
+    var step = await orchestrator.RunSessionAsync(session, workflowTimeoutCts.Token);
     sessionStore.Save(session);
 
     if (step.Status == WorkflowStepStatus.NeedsClarification)
@@ -252,7 +289,7 @@ app.MapPost("/estimate", async (
             session_id = session.SessionId,
             question = step.Question,
             clarification_round = session.QuestionsAsked,
-            max_clarification_rounds = Math.Max(1, options.Value.MaxClarificationRounds)
+            max_clarification_rounds = Math.Max(0, options.Value.MaxClarificationRounds)
         });
     }
 
@@ -300,7 +337,9 @@ app.MapPost("/estimate/document", async (
     }
 
     var session = sessionStore.Create(extraction.Text);
-    var step = await orchestrator.RunSessionAsync(session, cancellationToken);
+    using var workflowTimeoutCts = CreateWorkflowTimeoutCts(cancellationToken, options.Value.WorkflowTimeoutSeconds);
+
+    var step = await orchestrator.RunSessionAsync(session, workflowTimeoutCts.Token);
     sessionStore.Save(session);
 
     if (step.Status == WorkflowStepStatus.NeedsClarification)
@@ -311,7 +350,7 @@ app.MapPost("/estimate/document", async (
             session_id = session.SessionId,
             question = step.Question,
             clarification_round = session.QuestionsAsked,
-            max_clarification_rounds = Math.Max(1, options.Value.MaxClarificationRounds),
+            max_clarification_rounds = Math.Max(0, options.Value.MaxClarificationRounds),
             source = new
             {
                 file_name = file.FileName,

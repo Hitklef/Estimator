@@ -32,6 +32,7 @@ namespace Estimator.Core.Services
 
             if (await IsHealthyAsync(cancellationToken))
             {
+                _logger.LogDebug("Embedded llama-server is already healthy.");
                 return;
             }
 
@@ -58,6 +59,16 @@ namespace Estimator.Core.Services
                     throw new InvalidOperationException(
                         $"Model file not found: {_settings.LocalModelPath}");
                 }
+
+                _logger.LogInformation(
+                    "Starting embedded llama-server. Executable={ExecutablePath} Model={ModelPath} Host={Host} Port={Port} ContextSize={ContextSize} RequestedGpuLayers={GpuLayers}",
+                    executablePath,
+                    _settings.LocalModelPath,
+                    _settings.LlamaCppServerHost,
+                    _settings.LlamaCppServerPort,
+                    _settings.ContextSize,
+                    _settings.GpuLayerCount);
+
                 Exception? lastException = null;
                 foreach (var gpuLayers in BuildGpuLayerCandidates(_settings.GpuLayerCount))
                 {
@@ -81,7 +92,7 @@ namespace Estimator.Core.Services
                     {
                         if (!string.IsNullOrWhiteSpace(e.Data))
                         {
-                            _logger.LogDebug("llama-server: {Message}", e.Data);
+                            _logger.LogInformation("llama-server stdout: {Message}", e.Data);
                         }
                     };
                     process.ErrorDataReceived += (_, e) =>
@@ -97,6 +108,11 @@ namespace Estimator.Core.Services
                     {
                         throw new InvalidOperationException("Failed to start embedded llama-server process.");
                     }
+
+                    _logger.LogInformation(
+                        "llama-server process started. PID={Pid} n-gpu-layers={GpuLayers}",
+                        process.Id,
+                        gpuLayers);
 
                     process.BeginOutputReadLine();
                     process.BeginErrorReadLine();
@@ -147,6 +163,7 @@ namespace Estimator.Core.Services
             {
                 if (!_serverProcess.HasExited)
                 {
+                    _logger.LogInformation("Stopping embedded llama-server. PID={Pid}", _serverProcess.Id);
                     _serverProcess.Kill(entireProcessTree: true);
                     _serverProcess.WaitForExit(5000);
                 }
@@ -267,6 +284,7 @@ namespace Estimator.Core.Services
                 try
                 {
                     using var response = await _healthClient.GetAsync(url, cancellationToken);
+                    _logger.LogDebug("llama-server health probe {Url} -> {StatusCode}", url, (int)response.StatusCode);
                     if (response.IsSuccessStatusCode)
                     {
                         return true;
@@ -274,6 +292,7 @@ namespace Estimator.Core.Services
                 }
                 catch
                 {
+                    _logger.LogDebug("llama-server health probe failed for {Url}", url);
                 }
             }
 

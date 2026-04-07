@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace Estimator.Core.Agents
 {
@@ -40,9 +41,19 @@ namespace Estimator.Core.Agents
 
         public async Task<string> ExecuteAsync(string userInput, CancellationToken cancellationToken = default)
         {
-            _logger.LogInformation("Agent {Role} started processing.", Role);
+            var safeUserInput = userInput ?? string.Empty;
+            var stopwatch = Stopwatch.StartNew();
+            var inputLength = safeUserInput.Length;
+            _logger.LogInformation("Agent {Role} started processing. InputChars={InputChars}", Role, inputLength);
 
-            var response = await _modelGateway.CompleteAsync(Role, SystemPrompt, userInput, cancellationToken);
+            var response = await _modelGateway.CompleteAsync(Role, SystemPrompt, safeUserInput, cancellationToken);
+
+            stopwatch.Stop();
+            _logger.LogInformation(
+                "Agent {Role} completed. OutputChars={OutputChars} DurationMs={DurationMs}",
+                Role,
+                response.Length,
+                stopwatch.ElapsedMilliseconds);
 
             _logger.LogDebug("Agent {Role} raw response length: {Length}", Role, response.Length);
             return response;

@@ -1,5 +1,7 @@
 using System.Text;
 using System.Text.Json;
+using System.Diagnostics;
+using System.Text.RegularExpressions;
 using Estimator.Core.Agents;
 using Estimator.Core.Models;
 using Estimator.Core.Models.Options;
@@ -22,6 +24,7 @@ namespace Estimator.Core.Orchestrator
         private readonly int _maxValidationCycles;
         private readonly int _maxClarificationRounds;
         private readonly int _projectContextMaxCharacters;
+        private readonly int _maxDecomposerCallsPerSession;
 
         public AgentOrchestrator(
             DecomposerAgent decomposer,
@@ -35,8 +38,9 @@ namespace Estimator.Core.Orchestrator
             _validator = validator;
             _logger = logger;
             _maxValidationCycles = Math.Max(1, options.Value.MaxValidationCycles);
-            _maxClarificationRounds = Math.Max(1, options.Value.MaxClarificationRounds);
+            _maxClarificationRounds = Math.Max(0, options.Value.MaxClarificationRounds);
             _projectContextMaxCharacters = Math.Max(2000, options.Value.DecomposerProjectContextMaxCharacters);
+            _maxDecomposerCallsPerSession = Math.Max(1, options.Value.MaxDecomposerCallsPerSession);
         }
 
         public async Task<WorkflowStepResult> RunSessionAsync(
@@ -44,9 +48,19 @@ namespace Estimator.Core.Orchestrator
             CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(session);
+            var workflowStopwatch = Stopwatch.StartNew();
+            _logger.LogInformation(
+                "Workflow session started. SessionId={SessionId} DescriptionChars={DescriptionChars} ClarificationCount={ClarificationCount} QuestionsAsked={QuestionsAsked}",
+                session.SessionId,
+                session.ProjectDescription?.Length ?? 0,
+                session.Clarifications.Count,
+                session.QuestionsAsked);
 
             if (session.Result is not null)
             {
+                _logger.LogInformation(
+                    "Workflow session {SessionId} already has cached result. Returning immediately.",
+                    session.SessionId);
                 return WorkflowStepResult.Completed(session.Result);
             }
 
@@ -58,15 +72,22 @@ namespace Estimator.Core.Orchestrator
             var decomposition = await DecomposeAsync(session, cancellationToken);
             if (decomposition.NeedsClarification)
             {
+                workflowStopwatch.Stop();
                 session.PendingQuestion = decomposition.Question;
                 session.QuestionsAsked += 1;
                 session.UpdatedAtUtc = DateTime.UtcNow;
+                _logger.LogInformation(
+                    "Workflow session {SessionId} needs clarification. Question='{Question}' DurationMs={DurationMs}",
+                    session.SessionId,
+                    decomposition.Question,
+                    workflowStopwatch.ElapsedMilliseconds);
                 return WorkflowStepResult.NeedsClarification(decomposition.Question!);
             }
 
             session.PendingQuestion = null;
 
             var notes = new List<string>();
+            _logger.LogInformation("Session {SessionId}: Estimation phase started.", session.SessionId);
             var estimatedTasks = await EstimateTasksAsync(
                 session.ProjectDescription,
                 session.Clarifications,
@@ -78,6 +99,8 @@ namespace Estimator.Core.Orchestrator
             for (var cycle = 1; cycle <= _maxValidationCycles; cycle++)
             {
                 validationIterations = cycle;
+                var cycleStopwatch = Stopwatch.StartNew();
+                _logger.LogInformation("Session {SessionId}: Validation cycle {Cycle}/{MaxCycles} started.", session.SessionId, cycle, _maxValidationCycles);
 
                 var validatorInput = BuildValidatorInput(
                     session.ProjectDescription,
@@ -86,10 +109,14 @@ namespace Estimator.Core.Orchestrator
                     _projectContextMaxCharacters);
 
                 var validatorRaw = await _validator.ExecuteAsync(validatorInput, cancellationToken);
-                var feedback = ParseValidatorFeedback(validatorRaw);
+                var feedback = await ParseValidatorFeedbackWithRepairAsync(
+                    validatorInput,
+                    validatorRaw,
+                    cancellationToken);
 
                 if (feedback.IsValid)
                 {
+                    cycleStopwatch.Stop();
                     var validatedResult = BuildResult(
                         session.ProjectDescription,
                         session.Clarifications,
@@ -99,6 +126,13 @@ namespace Estimator.Core.Orchestrator
 
                     session.Result = validatedResult;
                     session.UpdatedAtUtc = DateTime.UtcNow;
+                    workflowStopwatch.Stop();
+                    _logger.LogInformation(
+                        "Session {SessionId}: Validation passed in cycle {Cycle}. Workflow completed. TotalDurationMs={TotalDurationMs} CycleDurationMs={CycleDurationMs}",
+                        session.SessionId,
+                        cycle,
+                        workflowStopwatch.ElapsedMilliseconds,
+                        cycleStopwatch.ElapsedMilliseconds);
                     return WorkflowStepResult.Completed(validatedResult);
                 }
 
@@ -114,6 +148,12 @@ namespace Estimator.Core.Orchestrator
                 }
 
                 _logger.LogWarning("Validator rejected estimate in cycle {Cycle}: {Reason}", cycle, feedback.Reason);
+                cycleStopwatch.Stop();
+                _logger.LogInformation(
+                    "Session {SessionId}: Validation cycle {Cycle} finished with rejection. CycleDurationMs={CycleDurationMs}",
+                    session.SessionId,
+                    cycle,
+                    cycleStopwatch.ElapsedMilliseconds);
 
                 if (cycle == _maxValidationCycles)
                 {
@@ -139,6 +179,11 @@ namespace Estimator.Core.Orchestrator
 
             session.Result = finalResult;
             session.UpdatedAtUtc = DateTime.UtcNow;
+            workflowStopwatch.Stop();
+            _logger.LogWarning(
+                "Session {SessionId}: Max validation cycles reached. Returning latest output. TotalDurationMs={TotalDurationMs}",
+                session.SessionId,
+                workflowStopwatch.ElapsedMilliseconds);
             return WorkflowStepResult.Completed(finalResult);
         }
 
@@ -146,30 +191,77 @@ namespace Estimator.Core.Orchestrator
             WorkflowSession session,
             CancellationToken cancellationToken)
         {
+            var decomposerCalls = 0;
+            async Task<string> ExecuteDecomposerAsync(string reason, string inputText)
+            {
+                decomposerCalls++;
+                if (decomposerCalls > _maxDecomposerCallsPerSession)
+                {
+                    throw new InvalidOperationException(
+                        $"Decomposer call limit exceeded ({_maxDecomposerCallsPerSession}) in session {session.SessionId}.");
+                }
+
+                var callStopwatch = Stopwatch.StartNew();
+                _logger.LogInformation(
+                    "Session {SessionId}: Decomposer call {Call}/{MaxCalls} started. Reason={Reason} InputChars={InputChars}",
+                    session.SessionId,
+                    decomposerCalls,
+                    _maxDecomposerCallsPerSession,
+                    reason,
+                    inputText.Length);
+
+                var output = await _decomposer.ExecuteAsync(inputText, cancellationToken);
+                callStopwatch.Stop();
+
+                _logger.LogInformation(
+                    "Session {SessionId}: Decomposer call {Call}/{MaxCalls} completed. OutputChars={OutputChars} DurationMs={DurationMs}",
+                    session.SessionId,
+                    decomposerCalls,
+                    _maxDecomposerCallsPerSession,
+                    output.Length,
+                    callStopwatch.ElapsedMilliseconds);
+
+                return output;
+            }
+
             var canAskMoreQuestions = session.QuestionsAsked < _maxClarificationRounds;
+            var forceFinalizeFromStart = !canAskMoreQuestions;
             var input = BuildDecomposerInput(
                 session.ProjectDescription,
                 session.Clarifications,
                 session.QuestionsAsked,
                 canAskMoreQuestions,
-                forceFinalize: false,
-                projectContextMaxCharacters: _projectContextMaxCharacters);
+                forceFinalize: forceFinalizeFromStart,
+                projectContextMaxCharacters: _projectContextMaxCharacters,
+                strictNoQuestionMode: false);
 
-            var raw = await _decomposer.ExecuteAsync(input, cancellationToken);
-            var decision = ParseDecomposerDecision(raw);
+            _logger.LogInformation(
+                "Session {SessionId}: Decomposer mode prepared. CanAskMoreQuestions={CanAskMoreQuestions} ForceFinalize={ForceFinalize} QuestionsAsked={QuestionsAsked}/{MaxRounds}",
+                session.SessionId,
+                canAskMoreQuestions,
+                forceFinalizeFromStart,
+                session.QuestionsAsked,
+                _maxClarificationRounds);
+
+            var raw = await ExecuteDecomposerAsync("initial", input);
+            var decision = await ParseDecomposerDecisionWithRepairAsync(input, raw, cancellationToken);
 
             if (decision.NeedsClarification && !canAskMoreQuestions)
             {
+                _logger.LogWarning(
+                    "Session {SessionId}: Decomposer requested clarification but budget exhausted. Forcing finalize.",
+                    session.SessionId);
                 var forcedInput = BuildDecomposerInput(
                     session.ProjectDescription,
                     session.Clarifications,
                     session.QuestionsAsked,
                     canAskMoreQuestions: false,
                     forceFinalize: true,
-                    projectContextMaxCharacters: _projectContextMaxCharacters);
+                    projectContextMaxCharacters: _projectContextMaxCharacters,
+                    strictNoQuestionMode: true);
 
-                var forcedRaw = await _decomposer.ExecuteAsync(forcedInput, cancellationToken);
-                decision = ParseDecomposerDecision(forcedRaw);
+                var forcedRaw = await ExecuteDecomposerAsync("forced-finalize-after-budget", forcedInput);
+                decision = await ParseDecomposerDecisionWithRepairAsync(forcedInput, forcedRaw, cancellationToken);
             }
 
             if (decision.NeedsClarification)
@@ -185,26 +277,37 @@ namespace Estimator.Core.Orchestrator
 
                 if (alreadyAsked)
                 {
+                    _logger.LogWarning(
+                        "Session {SessionId}: Decomposer repeated an already asked question. Forcing finalize.",
+                        session.SessionId);
                     var forcedInput = BuildDecomposerInput(
                         session.ProjectDescription,
                         session.Clarifications,
                         session.QuestionsAsked,
                         canAskMoreQuestions: false,
                         forceFinalize: true,
-                        projectContextMaxCharacters: _projectContextMaxCharacters);
+                        projectContextMaxCharacters: _projectContextMaxCharacters,
+                        strictNoQuestionMode: true);
 
-                    var forcedRaw = await _decomposer.ExecuteAsync(forcedInput, cancellationToken);
-                    decision = ParseDecomposerDecision(forcedRaw);
+                    var forcedRaw = await ExecuteDecomposerAsync("forced-finalize-after-duplicate-question", forcedInput);
+                    decision = await ParseDecomposerDecisionWithRepairAsync(forcedInput, forcedRaw, cancellationToken);
                 }
             }
 
             if (decision.Tasks is { Count: > 0 })
             {
+                _logger.LogInformation(
+                    "Session {SessionId}: Decomposer returned roadmap with {TaskCount} tasks.",
+                    session.SessionId,
+                    decision.Tasks.Count);
                 return decision;
             }
 
             if (decision.NeedsClarification)
             {
+                _logger.LogInformation(
+                    "Session {SessionId}: Decomposer returned clarification request.",
+                    session.SessionId);
                 return decision;
             }
 
@@ -218,14 +321,87 @@ namespace Estimator.Core.Orchestrator
             ValidatorFeedback? validatorFeedback,
             CancellationToken cancellationToken)
         {
+            var estimateStopwatch = Stopwatch.StartNew();
             var estimatorInput = BuildEstimatorInput(
                 projectDescription,
                 clarifications,
                 tasks,
                 validatorFeedback,
                 _projectContextMaxCharacters);
+            _logger.LogInformation(
+                "Estimator phase request. InputTaskCount={InputTaskCount} ValidatorFeedbackPresent={HasValidatorFeedback} InputChars={InputChars}",
+                tasks.Count,
+                validatorFeedback is not null,
+                estimatorInput.Length);
             var estimatorRaw = await _estimator.ExecuteAsync(estimatorInput, cancellationToken);
-            return ParseTasksOrThrow(estimatorRaw, "Estimator");
+            var parsed = await ParseTasksWithRepairAsync(
+                estimatorInput,
+                estimatorRaw,
+                "Estimator",
+                cancellationToken);
+            estimateStopwatch.Stop();
+            _logger.LogInformation(
+                "Estimator phase completed. OutputTaskCount={OutputTaskCount} DurationMs={DurationMs}",
+                parsed.Count,
+                estimateStopwatch.ElapsedMilliseconds);
+            return parsed;
+        }
+
+        private async Task<DecomposerDecision> ParseDecomposerDecisionWithRepairAsync(
+            string originalInput,
+            string rawResponse,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                return ParseDecomposerDecision(rawResponse);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Decomposer response parse failed. Starting format repair call. RawChars={RawChars}",
+                    rawResponse?.Length ?? 0);
+                var repairInput = originalInput +
+                                  "\n\nFORMAT REPAIR: Your previous reply was not valid JSON. " +
+                                  "Return ONLY valid JSON matching the required schema. No prose, no markdown.";
+
+                var repairedRaw = await _decomposer.ExecuteAsync(repairInput, cancellationToken);
+                _logger.LogInformation(
+                    "Decomposer format repair response received. RawChars={RawChars}",
+                    repairedRaw?.Length ?? 0);
+                return ParseDecomposerDecision(repairedRaw ?? string.Empty);
+            }
+        }
+
+        private async Task<List<ProjectTask>> ParseTasksWithRepairAsync(
+            string originalInput,
+            string rawResponse,
+            string agentName,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                return ParseTasksOrThrow(rawResponse, agentName);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "{AgentName} response parse failed. Starting format repair call. RawChars={RawChars}",
+                    agentName,
+                    rawResponse?.Length ?? 0);
+                var repairInput = originalInput +
+                                  "\n\nFORMAT REPAIR: Your previous reply was not valid JSON. " +
+                                  "Return ONLY a valid JSON array of tasks. No prose, no markdown.";
+
+                var repairedRaw = await _estimator.ExecuteAsync(repairInput, cancellationToken);
+                _logger.LogInformation(
+                    "{AgentName} format repair response received. RawChars={RawChars}",
+                    agentName,
+                    repairedRaw?.Length ?? 0);
+                return ParseTasksOrThrow(repairedRaw ?? string.Empty, agentName);
+            }
         }
 
         private string BuildDecomposerInput(
@@ -234,7 +410,8 @@ namespace Estimator.Core.Orchestrator
             int questionsAsked,
             bool canAskMoreQuestions,
             bool forceFinalize,
-            int projectContextMaxCharacters)
+            int projectContextMaxCharacters,
+            bool strictNoQuestionMode)
         {
             var boundedDescription = LimitText(projectDescription, projectContextMaxCharacters);
 
@@ -250,6 +427,10 @@ namespace Estimator.Core.Orchestrator
             if (forceFinalize || !canAskMoreQuestions)
             {
                 builder.AppendLine("Mode: Finalize roadmap now. You are not allowed to ask more questions in this turn.");
+                if (strictNoQuestionMode)
+                {
+                    builder.AppendLine("Strict mode: returning NEEDS_CLARIFICATION is forbidden. Return READY with tasks only.");
+                }
             }
             else
             {
@@ -340,10 +521,10 @@ namespace Estimator.Core.Orchestrator
                 throw new InvalidOperationException("Decomposer response is not valid JSON.");
             }
 
-            var response = JsonSerializer.Deserialize<DecomposerResponse>(objectJson, SerializerOptions);
+            var response = TryDeserializeWithAutoRepair<DecomposerResponse>(objectJson);
             if (response is null)
             {
-                throw new InvalidOperationException("Decomposer response could not be parsed.");
+                throw new InvalidOperationException("Decomposer response contains malformed JSON.");
             }
 
             if (response.Tasks is { Count: > 0 } &&
@@ -382,7 +563,7 @@ namespace Estimator.Core.Orchestrator
             var arrayJson = ExtractJsonArray(rawResponse);
             if (arrayJson is not null)
             {
-                var arrayTasks = JsonSerializer.Deserialize<List<ProjectTask>>(arrayJson, SerializerOptions);
+                var arrayTasks = TryDeserializeWithAutoRepair<List<ProjectTask>>(arrayJson);
                 if (arrayTasks is { Count: > 0 })
                 {
                     return arrayTasks;
@@ -395,7 +576,7 @@ namespace Estimator.Core.Orchestrator
                 return null;
             }
 
-            var objectPayload = JsonSerializer.Deserialize<TasksPayload>(objectJson, SerializerOptions);
+            var objectPayload = TryDeserializeWithAutoRepair<TasksPayload>(objectJson);
             if (objectPayload?.Tasks is { Count: > 0 })
             {
                 return objectPayload.Tasks;
@@ -422,13 +603,40 @@ namespace Estimator.Core.Orchestrator
                 throw new InvalidOperationException("Validator response is neither VALID nor a valid JSON object.");
             }
 
-            var feedback = JsonSerializer.Deserialize<ValidatorFeedback>(json, SerializerOptions);
+            var feedback = TryDeserializeWithAutoRepair<ValidatorFeedback>(json);
             if (feedback is null)
             {
-                throw new InvalidOperationException("Validator response could not be parsed.");
+                throw new InvalidOperationException("Validator response contains malformed JSON.");
             }
 
             return feedback;
+        }
+
+        private async Task<ValidatorFeedback> ParseValidatorFeedbackWithRepairAsync(
+            string originalInput,
+            string rawResponse,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                return ParseValidatorFeedback(rawResponse);
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Validator response parse failed. Starting format repair call. RawChars={RawChars}",
+                    rawResponse?.Length ?? 0);
+                var repairInput = originalInput +
+                                  "\n\nFORMAT REPAIR: Your previous reply was not valid. " +
+                                  "Return EXACTLY either 'VALID' or the required JSON object only.";
+
+                var repairedRaw = await _validator.ExecuteAsync(repairInput, cancellationToken);
+                _logger.LogInformation(
+                    "Validator format repair response received. RawChars={RawChars}",
+                    repairedRaw?.Length ?? 0);
+                return ParseValidatorFeedback(repairedRaw ?? string.Empty);
+            }
         }
 
         private static ProjectEstimationResult BuildResult(
@@ -482,12 +690,17 @@ namespace Estimator.Core.Orchestrator
             var cleaned = CleanText(input);
             var start = cleaned.IndexOf('[');
             var end = cleaned.LastIndexOf(']');
-            if (start < 0 || end <= start)
+            if (start < 0)
             {
                 return null;
             }
 
-            return cleaned.Substring(start, end - start + 1);
+            if (end > start)
+            {
+                return cleaned.Substring(start, end - start + 1);
+            }
+
+            return cleaned[start..];
         }
 
         private static string? ExtractJsonObject(string input)
@@ -495,12 +708,119 @@ namespace Estimator.Core.Orchestrator
             var cleaned = CleanText(input);
             var start = cleaned.IndexOf('{');
             var end = cleaned.LastIndexOf('}');
-            if (start < 0 || end <= start)
+            if (start < 0)
             {
                 return null;
             }
 
-            return cleaned.Substring(start, end - start + 1);
+            if (end > start)
+            {
+                return cleaned.Substring(start, end - start + 1);
+            }
+
+            return cleaned[start..];
+        }
+
+        private static T? TryDeserializeWithAutoRepair<T>(string json)
+            where T : class
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<T>(json, SerializerOptions);
+            }
+            catch (JsonException)
+            {
+                var repairedJson = TryAutoCloseJson(json);
+                if (string.Equals(repairedJson, json, StringComparison.Ordinal))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    return JsonSerializer.Deserialize<T>(repairedJson, SerializerOptions);
+                }
+                catch (JsonException)
+                {
+                    return null;
+                }
+            }
+        }
+
+        private static string TryAutoCloseJson(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return json;
+            }
+
+            var stack = new Stack<char>();
+            var builder = new StringBuilder(json.Length + 32);
+            var inString = false;
+            var escape = false;
+
+            foreach (var ch in json)
+            {
+                builder.Append(ch);
+
+                if (inString)
+                {
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+
+                    if (ch == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+
+                    if (ch == '"')
+                    {
+                        inString = false;
+                    }
+
+                    continue;
+                }
+
+                switch (ch)
+                {
+                    case '"':
+                        inString = true;
+                        break;
+                    case '{':
+                        stack.Push('}');
+                        break;
+                    case '[':
+                        stack.Push(']');
+                        break;
+                    case '}':
+                    case ']':
+                        if (stack.Count > 0 && stack.Peek() == ch)
+                        {
+                            stack.Pop();
+                        }
+                        break;
+                }
+            }
+
+            var repaired = builder.ToString().TrimEnd();
+            if (inString)
+            {
+                repaired += "\"";
+            }
+
+            repaired = Regex.Replace(repaired, @",\s*$", string.Empty, RegexOptions.CultureInvariant);
+            while (stack.Count > 0)
+            {
+                repaired = Regex.Replace(repaired, @",\s*$", string.Empty, RegexOptions.CultureInvariant);
+                repaired += stack.Pop();
+            }
+
+            repaired = Regex.Replace(repaired, @",\s*([}\]])", "$1", RegexOptions.CultureInvariant);
+            return repaired;
         }
 
         private sealed class DecomposerResponse
