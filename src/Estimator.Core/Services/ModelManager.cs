@@ -1,4 +1,6 @@
 using System.IO.Compression;
+using System.Net.Http.Json;
+using System.Text.Json;
 using Estimator.Core.Models.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -22,12 +24,11 @@ namespace Estimator.Core.Services
             _llamaCppServerManager = llamaCppServerManager;
         }
 
-        public async Task EnsureModelDownloadedAsync(CancellationToken cancellationToken = default)
+        public async Task EnsureModelReadyAsync(CancellationToken cancellationToken = default)
         {
-            await EnsureLocalModelAvailableAsync(cancellationToken);
-
             if (_settings.UseLlamaCppServer)
             {
+                await EnsureLocalModelAvailableAsync(cancellationToken);
                 await EnsureLlamaCppRuntimeAvailableAsync(cancellationToken);
 
                 if (_llamaCppServerManager is null)
@@ -36,7 +37,23 @@ namespace Estimator.Core.Services
                 }
 
                 await _llamaCppServerManager.EnsureStartedAsync(cancellationToken);
+                return;
             }
+
+            if (_settings.UseLLamaSharp)
+            {
+                await EnsureLocalModelAvailableAsync(cancellationToken);
+                return;
+            }
+
+            if (_settings.UseOllama)
+            {
+                await EnsureOllamaModelAvailableAsync(cancellationToken);
+                return;
+            }
+
+            throw new InvalidOperationException(
+                $"Unsupported ModelProvider '{_settings.ModelProvider}'.");
         }
 
         private async Task EnsureLocalModelAvailableAsync(CancellationToken cancellationToken)
@@ -120,6 +137,70 @@ namespace Estimator.Core.Services
             {
                 File.Delete(filePath);
             }
+        }
+
+        private async Task EnsureOllamaModelAvailableAsync(CancellationToken cancellationToken)
+        {
+            using var httpClient = new HttpClient
+            {
+                BaseAddress = new Uri(_settings.ResolveOllamaBaseUrl()),
+                Timeout = TimeSpan.FromMinutes(Math.Max(5, _settings.DownloadTimeoutMinutes))
+            };
+
+            using var tagsResponse = await httpClient.GetAsync("tags", cancellationToken);
+            if (!tagsResponse.IsSuccessStatusCode)
+            {
+                var body = await tagsResponse.Content.ReadAsStringAsync(cancellationToken);
+                throw new InvalidOperationException(
+                    $"Failed to reach Ollama model registry at {_settings.ResolveOllamaBaseUrl()}: {body}");
+            }
+
+            var tagsBody = await tagsResponse.Content.ReadAsStringAsync(cancellationToken);
+            OllamaTagsResponse? tags;
+            try
+            {
+                tags = JsonSerializer.Deserialize<OllamaTagsResponse>(tagsBody);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Ollama /tags response is invalid JSON.", ex);
+            }
+
+            var modelExists = tags?.Models?.Any(model =>
+                model.Name.Equals(_settings.OllamaModelName, StringComparison.OrdinalIgnoreCase)) == true;
+
+            if (modelExists)
+            {
+                _logger.LogInformation("Ollama model is available: {Model}", _settings.OllamaModelName);
+                return;
+            }
+
+            if (!_settings.OllamaAutoPullModel)
+            {
+                throw new InvalidOperationException(
+                    $"Ollama model '{_settings.OllamaModelName}' is not available. Pull it manually or enable OllamaAutoPullModel.");
+            }
+
+            _logger.LogWarning(
+                "Ollama model {Model} is missing. Pulling it from Ollama registry.",
+                _settings.OllamaModelName);
+
+            using var pullResponse = await httpClient.PostAsJsonAsync(
+                "pull",
+                new OllamaPullRequest
+                {
+                    Model = _settings.OllamaModelName,
+                    Stream = false
+                },
+                cancellationToken);
+
+            var pullBody = await pullResponse.Content.ReadAsStringAsync(cancellationToken);
+            if (!pullResponse.IsSuccessStatusCode)
+            {
+                throw new InvalidOperationException($"Failed to pull Ollama model: {pullBody}");
+            }
+
+            _logger.LogInformation("Ollama model pull completed: {Model}", _settings.OllamaModelName);
         }
 
         private async Task EnsureLlamaCppRuntimeAvailableAsync(CancellationToken cancellationToken)
@@ -261,6 +342,22 @@ namespace Estimator.Core.Services
 
                 File.Copy(file, targetFile, overwrite: true);
             }
+        }
+
+        private sealed class OllamaTagsResponse
+        {
+            public List<OllamaModelInfo> Models { get; set; } = new();
+        }
+
+        private sealed class OllamaModelInfo
+        {
+            public string Name { get; set; } = string.Empty;
+        }
+
+        private sealed class OllamaPullRequest
+        {
+            public string Model { get; set; } = string.Empty;
+            public bool Stream { get; set; }
         }
 
     }

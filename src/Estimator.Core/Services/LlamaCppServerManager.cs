@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using Estimator.Core.Models.Options;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -30,16 +31,35 @@ namespace Estimator.Core.Services
                 return;
             }
 
-            if (await IsHealthyAsync(cancellationToken))
+            var expectedSnapshot = BuildExpectedSnapshot();
+            var activeSnapshot = await TryGetServerSnapshotAsync(cancellationToken);
+
+            if (activeSnapshot is not null && MatchesExpected(activeSnapshot, expectedSnapshot))
             {
-                _logger.LogDebug("Embedded llama-server is already healthy.");
+                _logger.LogDebug(
+                    "Embedded llama-server is already healthy and matches expected configuration. Model={ModelPath} Ctx={ContextSize}",
+                    activeSnapshot.ModelPath,
+                    activeSnapshot.ContextSize);
                 return;
+            }
+
+            if (activeSnapshot is not null)
+            {
+                _logger.LogWarning(
+                    "Active llama-server configuration drift detected. ActiveModel={ActiveModel} ExpectedModel={ExpectedModel} ActiveCtx={ActiveCtx} ExpectedCtx={ExpectedCtx} ActiveWebUi={ActiveWebUi} ExpectedWebUi={ExpectedWebUi}. Restarting server.",
+                    activeSnapshot.ModelPath,
+                    expectedSnapshot.ModelPath,
+                    activeSnapshot.ContextSize,
+                    expectedSnapshot.ContextSize,
+                    activeSnapshot.WebUiEnabled,
+                    expectedSnapshot.WebUiEnabled);
             }
 
             await _startLock.WaitAsync(cancellationToken);
             try
             {
-                if (await IsHealthyAsync(cancellationToken))
+                activeSnapshot = await TryGetServerSnapshotAsync(cancellationToken);
+                if (activeSnapshot is not null && MatchesExpected(activeSnapshot, expectedSnapshot))
                 {
                     return;
                 }
@@ -121,11 +141,16 @@ namespace Estimator.Core.Services
                     var started = await WaitUntilHealthyAsync(process, cancellationToken);
                     if (started)
                     {
+                        var startedSnapshot = await TryGetServerSnapshotAsync(cancellationToken);
                         _logger.LogInformation(
-                            "Embedded llama-server started at http://{Host}:{Port} (n-gpu-layers={GpuLayers})",
+                            "Embedded llama-server started at http://{Host}:{Port} (n-gpu-layers={GpuLayers}) Model={ModelPath} Ctx={ContextSize} WebUi={WebUi} ReasoningFormat={ReasoningFormat}",
                             _settings.LlamaCppServerHost,
                             _settings.LlamaCppServerPort,
-                            gpuLayers);
+                            gpuLayers,
+                            startedSnapshot?.ModelPath ?? expectedSnapshot.ModelPath,
+                            startedSnapshot?.ContextSize ?? expectedSnapshot.ContextSize,
+                            startedSnapshot?.WebUiEnabled ?? expectedSnapshot.WebUiEnabled,
+                            startedSnapshot?.ReasoningFormat ?? expectedSnapshot.ReasoningFormat);
                         return;
                     }
 
@@ -154,46 +179,72 @@ namespace Estimator.Core.Services
 
         public void Stop()
         {
-            if (_serverProcess is null)
-            {
-                return;
-            }
-
-            try
-            {
-                if (!_serverProcess.HasExited)
-                {
-                    _logger.LogInformation("Stopping embedded llama-server. PID={Pid}", _serverProcess.Id);
-                    _serverProcess.Kill(entireProcessTree: true);
-                    _serverProcess.WaitForExit(5000);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to stop embedded llama-server cleanly.");
-            }
-            finally
-            {
-                _serverProcess.Dispose();
-                _serverProcess = null;
-            }
+            StopTrackedProcess();
+            StopMatchingExternalProcesses();
         }
 
         private string BuildArguments(string modelPath, int gpuLayers)
         {
-            var args =
+            var segments = new List<string>
+            {
                 $"--model \"{modelPath}\" " +
                 $"--ctx-size {_settings.ContextSize} " +
                 $"--n-gpu-layers {gpuLayers} " +
                 $"--host {_settings.LlamaCppServerHost} " +
-                $"--port {_settings.LlamaCppServerPort}";
+                $"--port {_settings.LlamaCppServerPort}"
+            };
+
+            if (_settings.LlamaCppThreads > 0)
+            {
+                segments.Add($"--threads {_settings.LlamaCppThreads}");
+            }
+
+            if (_settings.LlamaCppThreadsBatch > 0)
+            {
+                segments.Add($"--threads-batch {_settings.LlamaCppThreadsBatch}");
+            }
+
+            if (_settings.LlamaCppBatchSize > 0)
+            {
+                segments.Add($"--batch-size {_settings.LlamaCppBatchSize}");
+            }
+
+            if (_settings.LlamaCppUBatchSize > 0)
+            {
+                segments.Add($"--ubatch-size {_settings.LlamaCppUBatchSize}");
+            }
+
+            if (_settings.LlamaCppUseFlashAttention)
+            {
+                segments.Add("--flash-attn on");
+            }
+
+            if (_settings.LlamaCppDisableReasoning)
+            {
+                segments.Add("--reasoning off");
+            }
+
+            if (_settings.LlamaCppDisableWebUi)
+            {
+                segments.Add("--no-webui");
+            }
+
+            if (!string.IsNullOrWhiteSpace(_settings.LlamaCppCacheTypeK))
+            {
+                segments.Add($"--cache-type-k {_settings.LlamaCppCacheTypeK}");
+            }
+
+            if (!string.IsNullOrWhiteSpace(_settings.LlamaCppCacheTypeV))
+            {
+                segments.Add($"--cache-type-v {_settings.LlamaCppCacheTypeV}");
+            }
 
             if (!string.IsNullOrWhiteSpace(_settings.LlamaCppServerAdditionalArgs))
             {
-                args += " " + _settings.LlamaCppServerAdditionalArgs.Trim();
+                segments.Add(_settings.LlamaCppServerAdditionalArgs.Trim());
             }
 
-            return args;
+            return string.Join(" ", segments);
         }
 
         private static IEnumerable<int> BuildGpuLayerCandidates(int requestedLayers)
@@ -298,5 +349,171 @@ namespace Estimator.Core.Services
 
             return false;
         }
+
+        private async Task<ServerSnapshot?> TryGetServerSnapshotAsync(CancellationToken cancellationToken)
+        {
+            if (!await IsHealthyAsync(cancellationToken))
+            {
+                return null;
+            }
+
+            var url = $"http://{_settings.LlamaCppServerHost}:{_settings.LlamaCppServerPort}/props";
+            try
+            {
+                using var response = await _healthClient.GetAsync(url, cancellationToken);
+                if (!response.IsSuccessStatusCode)
+                {
+                    _logger.LogDebug("llama-server props probe {Url} -> {StatusCode}", url, (int)response.StatusCode);
+                    return null;
+                }
+
+                var body = await response.Content.ReadAsStringAsync(cancellationToken);
+                using var document = JsonDocument.Parse(body);
+                var root = document.RootElement;
+
+                var modelPath = root.TryGetProperty("model_path", out var modelPathNode)
+                    ? modelPathNode.GetString() ?? string.Empty
+                    : string.Empty;
+
+                var contextSize = 0;
+                if (root.TryGetProperty("default_generation_settings", out var generationSettings) &&
+                    generationSettings.TryGetProperty("n_ctx", out var ctxNode))
+                {
+                    contextSize = ctxNode.GetInt32();
+                }
+
+                var webUiEnabled = root.TryGetProperty("webui", out var webUiNode) && webUiNode.GetBoolean();
+                var reasoningFormat = "unknown";
+                if (root.TryGetProperty("default_generation_settings", out generationSettings) &&
+                    generationSettings.TryGetProperty("params", out var paramsNode) &&
+                    paramsNode.TryGetProperty("reasoning_format", out var reasoningNode))
+                {
+                    reasoningFormat = reasoningNode.GetString() ?? "unknown";
+                }
+
+                return new ServerSnapshot(
+                    NormalizePath(modelPath),
+                    contextSize,
+                    webUiEnabled,
+                    reasoningFormat);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Failed to inspect active llama-server properties.");
+                return null;
+            }
+        }
+
+        private ServerSnapshot BuildExpectedSnapshot() =>
+            new(
+                NormalizePath(_settings.LocalModelPath),
+                (int)_settings.ContextSize,
+                !_settings.LlamaCppDisableWebUi,
+                _settings.LlamaCppDisableReasoning ? "none" : "unknown");
+
+        private static bool MatchesExpected(ServerSnapshot active, ServerSnapshot expected)
+        {
+            if (!string.Equals(active.ModelPath, expected.ModelPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            if (active.ContextSize != expected.ContextSize)
+            {
+                return false;
+            }
+
+            if (active.WebUiEnabled != expected.WebUiEnabled)
+            {
+                return false;
+            }
+
+            if (!string.Equals(expected.ReasoningFormat, "unknown", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(active.ReasoningFormat, expected.ReasoningFormat, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        private void StopTrackedProcess()
+        {
+            if (_serverProcess is null)
+            {
+                return;
+            }
+
+            try
+            {
+                if (!_serverProcess.HasExited)
+                {
+                    _logger.LogInformation("Stopping embedded llama-server. PID={Pid}", _serverProcess.Id);
+                    _serverProcess.Kill(entireProcessTree: true);
+                    _serverProcess.WaitForExit(5000);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to stop embedded llama-server cleanly.");
+            }
+            finally
+            {
+                _serverProcess.Dispose();
+                _serverProcess = null;
+            }
+        }
+
+        private void StopMatchingExternalProcesses()
+        {
+            var expectedExecutablePath = NormalizePath(ResolveExecutablePath());
+            foreach (var process in Process.GetProcessesByName("llama-server"))
+            {
+                try
+                {
+                    if (_serverProcess is not null && process.Id == _serverProcess.Id)
+                    {
+                        continue;
+                    }
+
+                    var processPath = NormalizePath(process.MainModule?.FileName);
+                    if (!string.Equals(processPath, expectedExecutablePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (process.HasExited)
+                    {
+                        continue;
+                    }
+
+                    _logger.LogInformation(
+                        "Stopping stale llama-server process. PID={Pid} Path={Path}",
+                        process.Id,
+                        processPath);
+                    process.Kill(entireProcessTree: true);
+                    process.WaitForExit(5000);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to stop a stale llama-server process.");
+                }
+                finally
+                {
+                    process.Dispose();
+                }
+            }
+        }
+
+        private static string NormalizePath(string? path) =>
+            string.IsNullOrWhiteSpace(path)
+                ? string.Empty
+                : Path.GetFullPath(path.Trim());
+
+        private sealed record ServerSnapshot(
+            string ModelPath,
+            int ContextSize,
+            bool WebUiEnabled,
+            string ReasoningFormat);
     }
 }

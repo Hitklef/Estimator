@@ -39,7 +39,7 @@ namespace Estimator.Core.Orchestrator
             _logger = logger;
             _maxValidationCycles = Math.Max(1, options.Value.MaxValidationCycles);
             _maxClarificationRounds = Math.Max(0, options.Value.MaxClarificationRounds);
-            _projectContextMaxCharacters = Math.Max(2000, options.Value.DecomposerProjectContextMaxCharacters);
+            _projectContextMaxCharacters = Math.Max(2000, options.Value.ProjectContextMaxCharacters);
             _maxDecomposerCallsPerSession = Math.Max(1, options.Value.MaxDecomposerCallsPerSession);
         }
 
@@ -423,6 +423,7 @@ namespace Estimator.Core.Orchestrator
             builder.AppendLine(JsonSerializer.Serialize(clarifications, SerializerOptions));
             builder.AppendLine();
             builder.AppendLine($"Clarification budget: asked {questionsAsked} of {_maxClarificationRounds}.");
+            builder.AppendLine("Ask a clarification question only if the estimate would be materially wrong without it.");
 
             if (forceFinalize || !canAskMoreQuestions)
             {
@@ -607,6 +608,17 @@ namespace Estimator.Core.Orchestrator
             if (feedback is null)
             {
                 throw new InvalidOperationException("Validator response contains malformed JSON.");
+            }
+
+            if (feedback.IsValid)
+            {
+                feedback.TargetAgent = "Estimator";
+                return feedback;
+            }
+
+            if (string.IsNullOrWhiteSpace(feedback.TargetAgent))
+            {
+                feedback.TargetAgent = "Estimator";
             }
 
             return feedback;

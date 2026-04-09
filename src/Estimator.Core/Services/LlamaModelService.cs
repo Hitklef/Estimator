@@ -18,13 +18,21 @@ namespace Estimator.Core.Services
         private readonly LLamaWeights _weights;
         private readonly ModelParams _modelParams;
         private readonly StatelessExecutor _executor;
+        private readonly ModelPromptFormatter _promptFormatter;
+        private readonly ModelOutputConsoleTracer _outputTracer;
         private readonly SemaphoreSlim _inferenceLock = new(1, 1);
         private bool _disposed;
 
-        public LlamaModelService(IOptions<AiSettings> options, ILogger<LlamaModelService> logger)
+        public LlamaModelService(
+            IOptions<AiSettings> options,
+            ILogger<LlamaModelService> logger,
+            ModelPromptFormatter promptFormatter,
+            ModelOutputConsoleTracer outputTracer)
         {
             _settings = options.Value;
             _logger = logger;
+            _promptFormatter = promptFormatter;
+            _outputTracer = outputTracer;
 
             _logger.LogInformation("Initializing LLM engine. Model: {ModelPath}", _settings.LocalModelPath);
 
@@ -73,9 +81,7 @@ namespace Estimator.Core.Services
         }
 
         public async Task<string> CompleteAsync(
-            AgentRole role,
-            string systemPrompt,
-            string userInput,
+            ModelCompletionRequest request,
             CancellationToken cancellationToken = default)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -86,11 +92,21 @@ namespace Estimator.Core.Services
             await _inferenceLock.WaitAsync(timeoutCts.Token);
             try
             {
-                var profile = _settings.ResolveProfile(role.ToString());
-                var prompt = BuildPrompt(systemPrompt, userInput);
+                var profile = _settings.ResolveProfile(request.Role.ToString());
+                var prompt = _promptFormatter.BuildPrompt(request.SystemPrompt, request.UserInput);
                 var inference = CreateInferenceParams(profile);
 
-                return await InferInternalAsync(prompt, inference, timeoutCts.Token);
+                using var trace = _outputTracer.BeginStream(
+                    _logger,
+                    "LLamaSharp",
+                    request.Role,
+                    1,
+                    1);
+
+                var result = await InferInternalAsync(prompt, inference, trace, timeoutCts.Token);
+                trace.Complete();
+                _outputTracer.LogResponsePreview(_logger, "LLamaSharp", request.Role, result);
+                return result;
             }
             catch (LLamaDecodeError ex) when (IsNoKvSlot(ex))
             {
@@ -104,7 +120,7 @@ namespace Estimator.Core.Services
             {
                 _logger.LogWarning(
                     "Inference timed out for role {Role} after {TimeoutSeconds}s.",
-                    role,
+                    request.Role,
                     _settings.AgentInferenceTimeoutSeconds);
                 return string.Empty;
             }
@@ -126,20 +142,17 @@ namespace Estimator.Core.Services
                 }
             };
 
-        private static string BuildPrompt(string systemPrompt, string userInput)
-        {
-            var system = systemPrompt?.Trim() ?? string.Empty;
-            var input = userInput?.Trim() ?? string.Empty;
-
-            return $"<bos><|turn>system\n{system}<turn|>\n<|turn>user\n{input}<turn|>\n<|turn>model\n";
-        }
-
-        private async Task<string> InferInternalAsync(string prompt, InferenceParams inference, CancellationToken cancellationToken)
+        private async Task<string> InferInternalAsync(
+            string prompt,
+            InferenceParams inference,
+            ModelOutputConsoleTracer.StreamSession trace,
+            CancellationToken cancellationToken)
         {
             var builder = new StringBuilder(2048);
             await foreach (var text in _executor.InferAsync(prompt, inference).WithCancellation(cancellationToken))
             {
                 builder.Append(text);
+                trace.OnChunk(text);
             }
 
             return builder.ToString().Trim();

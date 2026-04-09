@@ -11,9 +11,12 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.Configure<AiSettings>(builder.Configuration.GetSection(AiSettings.SectionName));
 
 builder.Services.AddSingleton<ModelManager>();
+builder.Services.AddSingleton<ModelPromptFormatter>();
+builder.Services.AddSingleton<ModelOutputConsoleTracer>();
 builder.Services.AddSingleton<LlamaModelService>();
 builder.Services.AddSingleton<LlamaCppServerManager>();
 builder.Services.AddSingleton<LlamaCppHttpModelService>();
+builder.Services.AddSingleton<OllamaModelService>();
 builder.Services.AddSingleton<IAgentModelGateway>(provider =>
 {
     var settings = provider.GetRequiredService<IOptions<AiSettings>>().Value;
@@ -22,7 +25,17 @@ builder.Services.AddSingleton<IAgentModelGateway>(provider =>
         return provider.GetRequiredService<LlamaCppHttpModelService>();
     }
 
-    return provider.GetRequiredService<LlamaModelService>();
+    if (settings.UseOllama)
+    {
+        return provider.GetRequiredService<OllamaModelService>();
+    }
+
+    if (settings.UseLLamaSharp)
+    {
+        return provider.GetRequiredService<LlamaModelService>();
+    }
+
+    throw new InvalidOperationException($"Unsupported ModelProvider '{settings.ModelProvider}'.");
 });
 builder.Services.AddSingleton<DecomposerAgent>();
 builder.Services.AddSingleton<EstimatorAgent>();
@@ -43,7 +56,7 @@ if (runtimeSettings.UseLlamaCppServer)
 using (var scope = app.Services.CreateScope())
 {
     var modelManager = scope.ServiceProvider.GetRequiredService<ModelManager>();
-    await modelManager.EnsureModelDownloadedAsync();
+    await modelManager.EnsureModelReadyAsync();
 }
 
 app.UseHttpsRedirection();

@@ -11,6 +11,32 @@ namespace Estimator.Core.Agents
 
         public override AgentRole Role => AgentRole.Validator;
 
+        protected override string? JsonSchema =>
+            """
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": ["VALID", "REJECTED"]
+                },
+                "target_agent": {
+                  "type": "string",
+                  "enum": ["Estimator"]
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "invalid_task_ids": {
+                  "type": "array",
+                  "items": { "type": "integer", "minimum": 1 }
+                }
+              },
+              "required": ["status", "target_agent", "reason", "invalid_task_ids"]
+            }
+            """;
+
         protected override string SystemPrompt =>
             """
             You are Agent 3 (Validator).
@@ -23,10 +49,19 @@ namespace Estimator.Core.Agents
             3. Reject optimistic estimates.
             4. Do NOT request roadmap changes from Agent 1.
             5. Rework target must always be Estimator.
+            6. Return JSON only. No markdown, no prose, no code fences.
+            7. Reject only material estimate issues that meaningfully affect delivery planning.
 
             Response format:
-            - If valid, return exactly: VALID
-            - If invalid, return ONLY this JSON object:
+            - Always return ONLY one JSON object.
+            - Valid response:
+              {
+                "status": "VALID",
+                "target_agent": "Estimator",
+                "reason": "",
+                "invalid_task_ids": []
+              }
+            - Rejected response:
               {
                 "status": "REJECTED",
                 "target_agent": "Estimator",

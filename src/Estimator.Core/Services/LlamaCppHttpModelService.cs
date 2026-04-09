@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Estimator.Core.Agents;
@@ -16,17 +17,23 @@ namespace Estimator.Core.Services
         private readonly AiSettings _settings;
         private readonly LlamaCppServerManager _serverManager;
         private readonly ILogger<LlamaCppHttpModelService> _logger;
+        private readonly ModelPromptFormatter _promptFormatter;
+        private readonly ModelOutputConsoleTracer _outputTracer;
         private readonly HttpClient _httpClient;
         private volatile bool _preferLegacyCompletionEndpoint;
 
         public LlamaCppHttpModelService(
             IOptions<AiSettings> options,
             LlamaCppServerManager serverManager,
-            ILogger<LlamaCppHttpModelService> logger)
+            ILogger<LlamaCppHttpModelService> logger,
+            ModelPromptFormatter promptFormatter,
+            ModelOutputConsoleTracer outputTracer)
         {
             _settings = options.Value;
             _serverManager = serverManager;
             _logger = logger;
+            _promptFormatter = promptFormatter;
+            _outputTracer = outputTracer;
 
             var baseUrl = $"http://{_settings.LlamaCppServerHost}:{_settings.LlamaCppServerPort}/";
             _httpClient = new HttpClient
@@ -37,14 +44,12 @@ namespace Estimator.Core.Services
         }
 
         public async Task<string> CompleteAsync(
-            AgentRole role,
-            string systemPrompt,
-            string userInput,
+            ModelCompletionRequest request,
             CancellationToken cancellationToken = default)
         {
             await _serverManager.EnsureStartedAsync(cancellationToken);
 
-            var profile = _settings.ResolveProfile(role.ToString());
+            var profile = _settings.ResolveProfile(request.Role.ToString());
             var maxAttempts = Math.Max(1, _settings.LlamaCppMaxInferenceAttempts);
             var perAttemptTimeout = _settings.LlamaCppPerAttemptTimeoutSeconds > 0
                 ? TimeSpan.FromSeconds(_settings.LlamaCppPerAttemptTimeoutSeconds)
@@ -52,15 +57,15 @@ namespace Estimator.Core.Services
             var safetyTimeout = _settings.LlamaCppSafetyTimeoutSeconds > 0
                 ? TimeSpan.FromSeconds(_settings.LlamaCppSafetyTimeoutSeconds)
                 : (TimeSpan?)null;
-            var normalizedSystemPrompt = systemPrompt ?? string.Empty;
-            var attemptUserInput = userInput ?? string.Empty;
+            var normalizedSystemPrompt = request.SystemPrompt ?? string.Empty;
+            var attemptUserInput = request.UserInput ?? string.Empty;
             Exception? lastTimeoutException = null;
 
             if (perAttemptTimeout is null && safetyTimeout is null)
             {
                 _logger.LogWarning(
                     "All model timeouts are disabled. Requests may run indefinitely. Role={Role}",
-                    role);
+                    request.Role);
             }
 
             for (var attempt = 1; attempt <= maxAttempts; attempt++)
@@ -89,7 +94,7 @@ namespace Estimator.Core.Services
                 var attemptStopwatch = Stopwatch.StartNew();
                 _logger.LogInformation(
                     "LLM attempt started. Role={Role} Attempt={Attempt}/{MaxAttempts} MaxTokens={MaxTokens} InputChars={InputChars} SystemChars={SystemChars} EndpointPreference={EndpointPreference} PerAttemptTimeoutSec={PerAttemptTimeoutSec} SafetyTimeoutSec={SafetyTimeoutSec}",
-                    role,
+                    request.Role,
                     attempt,
                     maxAttempts,
                     maxTokens,
@@ -101,19 +106,30 @@ namespace Estimator.Core.Services
 
                 try
                 {
+                    using var trace = _outputTracer.BeginStream(
+                        _logger,
+                        "llama.cpp",
+                        request.Role,
+                        attempt,
+                        maxAttempts);
+
                     var content = await CompleteSingleAttemptAsync(
+                        request,
                         normalizedSystemPrompt,
                         attemptUserInput,
                         profile,
                         maxTokens,
+                        trace,
                         linkedCts.Token);
 
                     if (!string.IsNullOrWhiteSpace(content))
                     {
+                        trace.Complete();
+                        _outputTracer.LogResponsePreview(_logger, "llama.cpp", request.Role, content);
                         attemptStopwatch.Stop();
                         _logger.LogInformation(
                             "LLM attempt completed successfully. Role={Role} Attempt={Attempt}/{MaxAttempts} OutputChars={OutputChars} DurationMs={DurationMs}",
-                            role,
+                            request.Role,
                             attempt,
                             maxAttempts,
                             content.Length,
@@ -123,14 +139,14 @@ namespace Estimator.Core.Services
 
                     _logger.LogWarning(
                         "llama-server returned empty content for role {Role} (attempt {Attempt}/{MaxAttempts}, n_predict={MaxTokens}).",
-                        role,
+                        request.Role,
                         attempt,
                         maxAttempts,
                         maxTokens);
 
                     if (attempt < maxAttempts)
                     {
-                        attemptUserInput = ReduceInputForRetry(attemptUserInput, role, attempt + 1);
+                        attemptUserInput = ReduceInputForRetry(attemptUserInput, request.Role, attempt + 1);
                     }
                 }
                 catch (OperationCanceledException ex)
@@ -142,7 +158,7 @@ namespace Estimator.Core.Services
                     _logger.LogWarning(
                         ex,
                         "llama-server completion timed out for role {Role} (attempt {Attempt}/{MaxAttempts}, n_predict={MaxTokens}, timeout={TimeoutSeconds}s).",
-                        role,
+                        request.Role,
                         attempt,
                         maxAttempts,
                         maxTokens,
@@ -150,7 +166,7 @@ namespace Estimator.Core.Services
 
                     if (attempt < maxAttempts)
                     {
-                        attemptUserInput = ReduceInputForRetry(attemptUserInput, role, attempt + 1);
+                        attemptUserInput = ReduceInputForRetry(attemptUserInput, request.Role, attempt + 1);
                         await TryRestartServerAfterTimeoutAsync(cancellationToken);
                         continue;
                     }
@@ -165,7 +181,7 @@ namespace Estimator.Core.Services
                     _logger.LogError(
                         ex,
                         "LLM safety timeout triggered. Role={Role} Attempt={Attempt}/{MaxAttempts} SafetyTimeoutSec={SafetyTimeoutSec} InputChars={InputChars}",
-                        role,
+                        request.Role,
                         attempt,
                         maxAttempts,
                         safetyTimeout?.TotalSeconds,
@@ -215,20 +231,22 @@ namespace Estimator.Core.Services
         }
 
         private async Task<string> CompleteSingleAttemptAsync(
+            ModelCompletionRequest request,
             string systemPrompt,
             string userInput,
             AgentRuntimeProfile profile,
             int maxTokens,
+            ModelOutputConsoleTracer.StreamSession trace,
             CancellationToken cancellationToken)
         {
             if (_preferLegacyCompletionEndpoint)
             {
                 _logger.LogDebug("Using legacy completion endpoint because fallback mode is enabled.");
                 return await CompleteUsingLegacyEndpointAsync(
-                    systemPrompt,
-                    userInput,
+                    request,
                     profile,
                     maxTokens,
+                    trace,
                     cancellationToken);
             }
 
@@ -244,14 +262,18 @@ namespace Estimator.Core.Services
                 Temperature = profile.Temperature,
                 TopP = profile.TopP,
                 Stop = profile.AntiPrompts,
-                Stream = false
+                Stream = true
             };
 
-            var chatResponse = await _httpClient.PostAsJsonAsync(
+            using var chatResponse = await PostJsonForStreamAsync(
                 "v1/chat/completions",
                 chatRequest,
                 cancellationToken);
-            var chatBody = await chatResponse.Content.ReadAsStringAsync(cancellationToken);
+
+            var chatBody = chatResponse.IsSuccessStatusCode
+                ? string.Empty
+                : await chatResponse.Content.ReadAsStringAsync(cancellationToken);
+
             _logger.LogDebug(
                 "llama-server chat response status: {StatusCode}, body length: {BodyLength}",
                 (int)chatResponse.StatusCode,
@@ -266,27 +288,17 @@ namespace Estimator.Core.Services
                         "llama-server chat completions endpoint is unavailable for current model/runtime. Falling back to legacy completion endpoint.");
 
                     return await CompleteUsingLegacyEndpointAsync(
-                        systemPrompt,
-                        userInput,
+                        request,
                         profile,
                         maxTokens,
+                        trace,
                         cancellationToken);
                 }
 
                 ThrowForFailedStatus(chatResponse.StatusCode, chatBody);
             }
 
-            ChatCompletionResponse? parsed;
-            try
-            {
-                parsed = JsonSerializer.Deserialize<ChatCompletionResponse>(chatBody);
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException("Embedded llama-server chat response is invalid JSON.", ex);
-            }
-
-            var content = parsed?.Choices?.FirstOrDefault()?.Message?.Content?.Trim() ?? string.Empty;
+            var content = await ReadChatStreamAsync(chatResponse, trace, cancellationToken);
             if (!string.IsNullOrWhiteSpace(content))
             {
                 return content;
@@ -296,32 +308,35 @@ namespace Estimator.Core.Services
                 "llama-server chat endpoint returned empty content. Falling back to legacy completion endpoint for this attempt.");
 
             return await CompleteUsingLegacyEndpointAsync(
-                systemPrompt,
-                userInput,
+                request,
                 profile,
                 maxTokens,
+                trace,
                 cancellationToken);
         }
 
         private async Task<string> CompleteUsingLegacyEndpointAsync(
-            string systemPrompt,
-            string userInput,
+            ModelCompletionRequest completionRequest,
             AgentRuntimeProfile profile,
             int maxTokens,
+            ModelOutputConsoleTracer.StreamSession trace,
             CancellationToken cancellationToken)
         {
-            var prompt = BuildPrompt(systemPrompt, userInput);
-            var request = new CompletionRequest
+            var prompt = _promptFormatter.BuildPrompt(completionRequest.SystemPrompt, completionRequest.UserInput);
+            var payload = new CompletionRequest
             {
                 Prompt = prompt,
                 NPredict = maxTokens,
                 Temperature = profile.Temperature,
                 TopP = profile.TopP,
-                Stop = profile.AntiPrompts
+                Stop = profile.AntiPrompts,
+                Stream = true
             };
 
-            var response = await _httpClient.PostAsJsonAsync("completion", request, cancellationToken);
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            using var response = await PostJsonForStreamAsync("completion", payload, cancellationToken);
+            var body = response.IsSuccessStatusCode
+                ? string.Empty
+                : await response.Content.ReadAsStringAsync(cancellationToken);
             _logger.LogDebug(
                 "llama-server legacy response status: {StatusCode}, body length: {BodyLength}",
                 (int)response.StatusCode,
@@ -332,17 +347,7 @@ namespace Estimator.Core.Services
                 ThrowForFailedStatus(response.StatusCode, body);
             }
 
-            CompletionResponse? parsed;
-            try
-            {
-                parsed = JsonSerializer.Deserialize<CompletionResponse>(body);
-            }
-            catch (Exception ex)
-            {
-                throw new InvalidOperationException("Embedded llama-server legacy response is invalid JSON.", ex);
-            }
-
-            return parsed?.Content?.Trim() ?? string.Empty;
+            return await ReadLegacyCompletionStreamAsync(response, trace, cancellationToken);
         }
 
         private async Task TryRestartServerAfterTimeoutAsync(CancellationToken cancellationToken)
@@ -422,11 +427,150 @@ namespace Estimator.Core.Services
                    message.Contains("timed out", StringComparison.OrdinalIgnoreCase);
         }
 
-        private static string BuildPrompt(string systemPrompt, string userInput)
+        private async Task<HttpResponseMessage> PostJsonForStreamAsync(
+            string endpoint,
+            object payload,
+            CancellationToken cancellationToken)
         {
-            var system = systemPrompt.Trim();
-            var input = userInput.Trim();
-            return $"System:\n{system}\n\nUser:\n{input}\n\nAssistant:\n";
+            var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
+            {
+                Content = JsonContent.Create(payload)
+            };
+
+            return await _httpClient.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken);
+        }
+
+        private static async Task<string> ReadChatStreamAsync(
+            HttpResponseMessage response,
+            ModelOutputConsoleTracer.StreamSession trace,
+            CancellationToken cancellationToken)
+        {
+            var builder = new StringBuilder(1024);
+
+            await foreach (var payload in ReadSsePayloadsAsync(response, cancellationToken))
+            {
+                var chunk = ExtractChatChunk(payload);
+                if (string.IsNullOrEmpty(chunk))
+                {
+                    continue;
+                }
+
+                builder.Append(chunk);
+                trace.OnChunk(chunk);
+            }
+
+            return builder.ToString().Trim();
+        }
+
+        private static async Task<string> ReadLegacyCompletionStreamAsync(
+            HttpResponseMessage response,
+            ModelOutputConsoleTracer.StreamSession trace,
+            CancellationToken cancellationToken)
+        {
+            var builder = new StringBuilder(1024);
+
+            await foreach (var payload in ReadSsePayloadsAsync(response, cancellationToken))
+            {
+                var chunk = ExtractLegacyChunk(payload);
+                if (string.IsNullOrEmpty(chunk))
+                {
+                    continue;
+                }
+
+                builder.Append(chunk);
+                trace.OnChunk(chunk);
+            }
+
+            return builder.ToString().Trim();
+        }
+
+        private static async IAsyncEnumerable<string> ReadSsePayloadsAsync(
+            HttpResponseMessage response,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var reader = new StreamReader(stream);
+
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var line = await reader.ReadLineAsync(cancellationToken);
+                if (line is null)
+                {
+                    yield break;
+                }
+
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                if (!line.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var payload = line["data:".Length..].Trim();
+                if (payload.Equals("[DONE]", StringComparison.OrdinalIgnoreCase))
+                {
+                    yield break;
+                }
+
+                yield return payload;
+            }
+        }
+
+        private static string ExtractChatChunk(string payload)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(payload);
+                var root = document.RootElement;
+                if (!root.TryGetProperty("choices", out var choices) || choices.GetArrayLength() == 0)
+                {
+                    return string.Empty;
+                }
+
+                var choice = choices[0];
+                if (choice.TryGetProperty("delta", out var delta) &&
+                    delta.TryGetProperty("content", out var deltaContent))
+                {
+                    return deltaContent.GetString() ?? string.Empty;
+                }
+
+                if (choice.TryGetProperty("message", out var message) &&
+                    message.TryGetProperty("content", out var messageContent))
+                {
+                    return messageContent.GetString() ?? string.Empty;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+
+            return string.Empty;
+        }
+
+        private static string ExtractLegacyChunk(string payload)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(payload);
+                var root = document.RootElement;
+
+                if (root.TryGetProperty("content", out var content))
+                {
+                    return content.GetString() ?? string.Empty;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+
+            return string.Empty;
         }
 
         private sealed class ChatCompletionRequest
@@ -490,6 +634,9 @@ namespace Estimator.Core.Services
 
             [JsonPropertyName("stop")]
             public List<string> Stop { get; set; } = new();
+
+            [JsonPropertyName("stream")]
+            public bool Stream { get; set; }
         }
 
         private sealed class CompletionResponse

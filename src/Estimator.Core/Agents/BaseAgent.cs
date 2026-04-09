@@ -19,9 +19,7 @@ namespace Estimator.Core.Agents
     public interface IAgentModelGateway
     {
         Task<string> CompleteAsync(
-            AgentRole role,
-            string systemPrompt,
-            string userInput,
+            ModelCompletionRequest request,
             CancellationToken cancellationToken = default);
     }
 
@@ -31,6 +29,9 @@ namespace Estimator.Core.Agents
         private readonly ILogger _logger;
 
         protected abstract string SystemPrompt { get; }
+        protected virtual ModelResponseFormat ResponseFormat => ModelResponseFormat.Json;
+        protected virtual string? JsonSchema => null;
+        protected virtual bool EnableThinking => false;
         public abstract AgentRole Role { get; }
 
         protected BaseAgent(IAgentModelGateway modelGateway, ILogger logger)
@@ -46,7 +47,17 @@ namespace Estimator.Core.Agents
             var inputLength = safeUserInput.Length;
             _logger.LogInformation("Agent {Role} started processing. InputChars={InputChars}", Role, inputLength);
 
-            var response = await _modelGateway.CompleteAsync(Role, SystemPrompt, safeUserInput, cancellationToken);
+            var request = new ModelCompletionRequest
+            {
+                Role = Role,
+                SystemPrompt = SystemPrompt,
+                UserInput = safeUserInput,
+                ResponseFormat = ResponseFormat,
+                JsonSchema = JsonSchema,
+                EnableThinking = EnableThinking
+            };
+
+            var response = await _modelGateway.CompleteAsync(request, cancellationToken);
 
             stopwatch.Stop();
             _logger.LogInformation(
