@@ -298,7 +298,11 @@ namespace Estimator.Core.Services
                 ThrowForFailedStatus(chatResponse.StatusCode, chatBody);
             }
 
-            var content = await ReadChatStreamAsync(chatResponse, trace, cancellationToken);
+            var content = await ReadChatStreamAsync(
+                chatResponse,
+                request.ResponseFormat,
+                trace,
+                cancellationToken);
             if (!string.IsNullOrWhiteSpace(content))
             {
                 return content;
@@ -347,7 +351,11 @@ namespace Estimator.Core.Services
                 ThrowForFailedStatus(response.StatusCode, body);
             }
 
-            return await ReadLegacyCompletionStreamAsync(response, trace, cancellationToken);
+            return await ReadLegacyCompletionStreamAsync(
+                response,
+                completionRequest.ResponseFormat,
+                trace,
+                cancellationToken);
         }
 
         private async Task TryRestartServerAfterTimeoutAsync(CancellationToken cancellationToken)
@@ -445,6 +453,7 @@ namespace Estimator.Core.Services
 
         private static async Task<string> ReadChatStreamAsync(
             HttpResponseMessage response,
+            ModelResponseFormat responseFormat,
             ModelOutputConsoleTracer.StreamSession trace,
             CancellationToken cancellationToken)
         {
@@ -460,6 +469,12 @@ namespace Estimator.Core.Services
 
                 builder.Append(chunk);
                 trace.OnChunk(chunk);
+
+                if (responseFormat == ModelResponseFormat.Json &&
+                    TryExtractCompletedJson(builder, out var completedJson))
+                {
+                    return completedJson;
+                }
             }
 
             return builder.ToString().Trim();
@@ -467,6 +482,7 @@ namespace Estimator.Core.Services
 
         private static async Task<string> ReadLegacyCompletionStreamAsync(
             HttpResponseMessage response,
+            ModelResponseFormat responseFormat,
             ModelOutputConsoleTracer.StreamSession trace,
             CancellationToken cancellationToken)
         {
@@ -482,9 +498,114 @@ namespace Estimator.Core.Services
 
                 builder.Append(chunk);
                 trace.OnChunk(chunk);
+
+                if (responseFormat == ModelResponseFormat.Json &&
+                    TryExtractCompletedJson(builder, out var completedJson))
+                {
+                    return completedJson;
+                }
             }
 
             return builder.ToString().Trim();
+        }
+
+        private static bool TryExtractCompletedJson(
+            StringBuilder builder,
+            out string completedJson)
+        {
+            return TryExtractCompletedJson(builder.ToString(), out completedJson);
+        }
+
+        private static bool TryExtractCompletedJson(
+            string value,
+            out string completedJson)
+        {
+            completedJson = string.Empty;
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+
+            var start = FindJsonStart(value);
+            if (start < 0)
+            {
+                return false;
+            }
+
+            var stack = new Stack<char>();
+            var inString = false;
+            var escape = false;
+
+            for (var index = start; index < value.Length; index++)
+            {
+                var ch = value[index];
+
+                if (inString)
+                {
+                    if (escape)
+                    {
+                        escape = false;
+                        continue;
+                    }
+
+                    if (ch == '\\')
+                    {
+                        escape = true;
+                        continue;
+                    }
+
+                    if (ch == '"')
+                    {
+                        inString = false;
+                    }
+
+                    continue;
+                }
+
+                switch (ch)
+                {
+                    case '"':
+                        inString = true;
+                        break;
+                    case '{':
+                        stack.Push('}');
+                        break;
+                    case '[':
+                        stack.Push(']');
+                        break;
+                    case '}':
+                    case ']':
+                        if (stack.Count == 0 || stack.Peek() != ch)
+                        {
+                            return false;
+                        }
+
+                        stack.Pop();
+                        if (stack.Count == 0)
+                        {
+                            completedJson = value[start..(index + 1)].Trim();
+                            return true;
+                        }
+
+                        break;
+                }
+            }
+
+            return false;
+        }
+
+        private static int FindJsonStart(string value)
+        {
+            for (var index = 0; index < value.Length; index++)
+            {
+                var ch = value[index];
+                if (ch is '{' or '[')
+                {
+                    return index;
+                }
+            }
+
+            return -1;
         }
 
         private static async IAsyncEnumerable<string> ReadSsePayloadsAsync(

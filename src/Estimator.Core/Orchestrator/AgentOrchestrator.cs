@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Serialization;
 using System.Text.Json;
 using System.Diagnostics;
 using System.Text.RegularExpressions;
@@ -534,15 +535,35 @@ namespace Estimator.Core.Orchestrator
                 return DecomposerDecision.Ready(response.Tasks);
             }
 
+            if (response.Roadmap is { Count: > 0 } &&
+                (response.IsSufficient == true ||
+                 string.IsNullOrWhiteSpace(response.Status) ||
+                 response.Status.Equals("READY", StringComparison.OrdinalIgnoreCase)))
+            {
+                return DecomposerDecision.Ready(response.Roadmap);
+            }
+
             if (response.Status.Equals("NEEDS_CLARIFICATION", StringComparison.OrdinalIgnoreCase) &&
                 !string.IsNullOrWhiteSpace(response.Question))
             {
                 return DecomposerDecision.Ask(response.Question);
             }
 
+            if (response.IsSufficient == false &&
+                !string.IsNullOrWhiteSpace(response.ClarificationQuestion))
+            {
+                return DecomposerDecision.Ask(response.ClarificationQuestion);
+            }
+
             if (!string.IsNullOrWhiteSpace(response.Question) && response.Tasks.Count == 0)
             {
                 return DecomposerDecision.Ask(response.Question);
+            }
+
+            if (!string.IsNullOrWhiteSpace(response.ClarificationQuestion) &&
+                (response.Roadmap is null || response.Roadmap.Count == 0))
+            {
+                return DecomposerDecision.Ask(response.ClarificationQuestion);
             }
 
             throw new InvalidOperationException("Decomposer response does not contain valid clarification or tasks.");
@@ -837,9 +858,23 @@ namespace Estimator.Core.Orchestrator
 
         private sealed class DecomposerResponse
         {
+            [JsonPropertyName("status")]
             public string Status { get; set; } = string.Empty;
+
+            [JsonPropertyName("question")]
             public string Question { get; set; } = string.Empty;
+
+            [JsonPropertyName("tasks")]
             public List<ProjectTask> Tasks { get; set; } = new();
+
+            [JsonPropertyName("is_sufficient")]
+            public bool? IsSufficient { get; set; }
+
+            [JsonPropertyName("clarification_question")]
+            public string ClarificationQuestion { get; set; } = string.Empty;
+
+            [JsonPropertyName("roadmap")]
+            public List<ProjectTask> Roadmap { get; set; } = new();
         }
 
         private sealed class TasksPayload
